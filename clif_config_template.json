@@ -1,0 +1,8 @@
+{
+  "site_name": "<SITE_NAME e.g. site_a>",
+  "data_directory": "<FULL_PATH_TO_CLIF_TABLE_DIRECTORY>",
+  "filetype": "parquet",
+  "timezone": "<TIMEZONE_STRING e.g. America/Chicago>",
+  "output_directory": "./output_phi",
+  "output_to_share_directory": "./output_to_share"
+}

@@ -1,0 +1,11 @@
+[project]
+name = "induction-variability-rsi"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "clifpy>=0.4.2",
+    "marimo>=0.21.1",
+    "tabulate>=0.10.0",
+]
