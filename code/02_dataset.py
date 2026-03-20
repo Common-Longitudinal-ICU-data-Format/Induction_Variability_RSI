@@ -335,10 +335,10 @@ def _(DATA_DIR, FILETYPE, TIMEZONE, cohort, compute_ase, pl):
         timezone=TIMEZONE,
     )
 
-    for _col in ase_pd.select_dtypes(include=["datetimetz"]).columns:
-        ase_pd[_col] = ase_pd[_col].dt.tz_convert(None)
-
     ase_pl = pl.from_pandas(ase_pd)
+    _tz_cols = [name for name, dtype in ase_pl.schema.items() if getattr(dtype, "time_zone", None) is not None]
+    if _tz_cols:
+        ase_pl = ase_pl.with_columns(pl.col(c).dt.replace_time_zone(None) for c in _tz_cols)
 
     # Filter to onset within 7 days before index_dttm
     _ase_check = (
@@ -585,7 +585,8 @@ def _(Adt, DATA_DIR, FILETYPE, PatientProcedures, TIMEZONE, cohort, pl):
     del _adt_pd
 
     adt_pl = adt_pl.with_columns(
-        pl.col("location_category").str.to_lowercase().alias("location_category")
+        pl.col("location_category").str.to_lowercase().alias("location_category"),
+        pl.col("location_type").str.to_lowercase().alias("location_type"),
     )
 
     # Location at intubation (index_dttm)
@@ -596,7 +597,14 @@ def _(Adt, DATA_DIR, FILETYPE, PatientProcedures, TIMEZONE, cohort, pl):
             (pl.col("index_dttm") >= pl.col("in_dttm"))
             & (pl.col("index_dttm") < pl.col("out_dttm"))
         )
-        .select(["hospitalization_id", pl.col("location_category").alias("location_at_intubation")])
+        .select([
+            "hospitalization_id",
+            pl.col("location_category").alias("location_at_intubation"),
+            pl.when(pl.col("location_category") == "icu")
+              .then(pl.col("location_type"))
+              .otherwise(pl.lit(None))
+              .alias("icu_type"),
+        ])
         .group_by("hospitalization_id").first()
     )
 

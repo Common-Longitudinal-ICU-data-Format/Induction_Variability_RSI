@@ -141,13 +141,32 @@ def _(DATA_DIR, FILETYPE, PatientProcedures, SITE, TIMEZONE, hosp_pl, pl):
             & (pl.col("billing_provider_id") != "")
         )
 
+    # Count hospitalizations with ANY CPT 31500 (regardless of provider)
+    _hosp_with_any_cpt = hosp_pl.filter(
+        pl.col("hospitalization_id").is_in(_cpt_base["hospitalization_id"].unique())
+    )
+    n_no_cpt = hosp_pl.height - _hosp_with_any_cpt.height
+    n_cpt_no_provider = _hosp_with_any_cpt.height - hosp_pl.filter(
+        pl.col("hospitalization_id").is_in(cpt_31500["hospitalization_id"].unique())
+    ).height
+
     hosp_with_cpt = hosp_pl.filter(
         pl.col("hospitalization_id").is_in(cpt_31500["hospitalization_id"].unique())
     )
     n_after_cpt = hosp_with_cpt.height
     n_excl_cpt = hosp_pl.height - n_after_cpt
     print(f"After CPT 31500 filter: {n_after_cpt:,} (excluded {n_excl_cpt:,})")
-    return cpt_31500, hosp_with_cpt, n_after_cpt, n_excl_cpt, procs_pl
+    print(f"  - No CPT 31500: {n_no_cpt:,}")
+    print(f"  - CPT 31500 but no billing provider: {n_cpt_no_provider:,}")
+    return (
+        cpt_31500,
+        hosp_with_cpt,
+        n_after_cpt,
+        n_cpt_no_provider,
+        n_excl_cpt,
+        n_no_cpt,
+        procs_pl,
+    )
 
 
 @app.cell
@@ -159,7 +178,7 @@ def _(
     hosp_with_cpt,
     pl,
 ):
-    # Inclusion 4: RSI medication pairing within 3 minutes
+    # Inclusion 4: RSI medication pairing within 5 minutes
     INDUCTION_AGENTS = ["etomidate", "ketamine"]
     PARALYTICS = ["rocuronium", "succinylcholine"]
     RSI_MEDS = INDUCTION_AGENTS + PARALYTICS
@@ -221,17 +240,17 @@ def _(
         pl.min_horizontal("admin_dttm_ind", "admin_dttm_par").alias("index_dttm")
     ).sort("index_dttm").group_by("hospitalization_id").first()
 
-    # Filter to pairs within 3 minutes for cohort definition
-    pairs_3min = pairs_30min.filter(pl.col("time_diff_min") <= 3)
+    # Filter to pairs within 5 minutes for cohort definition
+    pairs_5min = pairs_30min.filter(pl.col("time_diff_min") <= 5)
 
     # Index time = earliest of the pair
-    pairs_3min = pairs_3min.with_columns(
+    pairs_5min = pairs_5min.with_columns(
         pl.min_horizontal("admin_dttm_ind", "admin_dttm_par").alias("index_dttm")
     )
 
     # Keep earliest RSI event per hospitalization
     rsi_events = (
-        pairs_3min.sort("index_dttm")
+        pairs_5min.sort("index_dttm")
         .group_by("hospitalization_id")
         .first()
     )
@@ -298,7 +317,7 @@ def _(OUTPUT_DIR, OUTPUT_TO_SHARE_DIR, mo, pairs_30min, pl):
         edgecolor="black",
         linewidth=0.5,
     )
-    ax.axvline(x=3, color="red", linestyle="--", linewidth=1.5, label="Cohort threshold (3 min)")
+    ax.axvline(x=5, color="red", linestyle="--", linewidth=1.5, label="Cohort threshold (5 min)")
     ax.set_xlabel("Time difference (minutes)")
     ax.set_ylabel("Count")
     ax.set_title("RSI Induction-Paralytic Timing Distribution (first pair per hospitalization, ≤30 min)")
@@ -595,7 +614,7 @@ def _(DATA_DIR, FILETYPE, TIMEZONE, Vitals, cohort_e4, pl):
     n_excl_e5 = cohort_e4.height - cohort_e5.height
     n_after_e5 = cohort_e5.height
     print(f"Excl 5 - No charted weight: excluded {n_excl_e5:,}, remaining {n_after_e5:,}")
-    return cohort_e5, n_after_e5, n_excl_e5
+    return cohort_e5, n_after_e5, n_excl_e5, weights_pl
 
 
 @app.cell
@@ -744,6 +763,7 @@ def _(
     n_after_imv,
     n_after_loc,
     n_after_rsi,
+    n_cpt_no_provider,
     n_excl_age,
     n_excl_cpt,
     n_excl_date,
@@ -758,6 +778,7 @@ def _(
     n_excl_imv,
     n_excl_loc,
     n_excl_rsi,
+    n_no_cpt,
     n_total,
     pl,
 ):
@@ -768,8 +789,8 @@ def _(
             {"step": 0, "description": "Total hospitalizations", "n_remaining": n_total, "n_excluded": 0, "exclusion_reason": None},
             {"step": 1, "description": "Age >= 18", "n_remaining": n_total - n_excl_age, "n_excluded": n_excl_age, "exclusion_reason": "Age < 18"},
             {"step": 2, "description": "Admission & discharge 2018-01-01 to 2025-12-31", "n_remaining": n_after_date, "n_excluded": n_excl_date, "exclusion_reason": "Admission or discharge outside study date range"},
-            {"step": 3, "description": "CPT 31500 with billing provider", "n_remaining": n_after_cpt, "n_excluded": n_excl_cpt, "exclusion_reason": "No CPT 31500 or missing billing_provider_id"},
-            {"step": 4, "description": "RSI pairing (induction + paralytic within 3 min)", "n_remaining": n_after_rsi, "n_excluded": n_excl_rsi, "exclusion_reason": "No valid RSI medication pair"},
+            {"step": 3, "description": "CPT 31500 with billing provider", "n_remaining": n_after_cpt, "n_excluded": n_excl_cpt, "exclusion_reason": "No CPT 31500 or missing billing_provider_id", "n_no_cpt": n_no_cpt, "n_cpt_no_provider": n_cpt_no_provider},
+            {"step": 4, "description": "RSI pairing (induction + paralytic within 5 min)", "n_remaining": n_after_rsi, "n_excluded": n_excl_rsi, "exclusion_reason": "No valid RSI medication pair"},
             {"step": 5, "description": "ED or ICU location at RSI time", "n_remaining": n_after_loc, "n_excluded": n_excl_loc, "exclusion_reason": "Not in ED or ICU at RSI time"},
             {"step": 6, "description": "IMV within 6 hours of induction", "n_remaining": n_after_imv, "n_excluded": n_excl_imv, "exclusion_reason": "No IMV within 6 hours"},
             {"step": 7, "description": "No procedural location on CPT 31500 date", "n_remaining": n_after_e1, "n_excluded": n_excl_e1, "exclusion_reason": "CPT 31500 on same day as procedural location"},
@@ -878,6 +899,151 @@ def _(cohort_out, mo, pl):
     _ax.legend()
     _plt.tight_layout()
 
+    mo.as_html(_fig)
+    return
+
+
+@app.cell
+def _(OUTPUT_DIR, OUTPUT_TO_SHARE_DIR, cohort_out, mo, pl, weights_pl):
+    import matplotlib.pyplot as _plt
+
+    # --- Weight Timing & Change Sub-Analysis ---
+    _final_ids = cohort_out["hospitalization_id"].unique()
+    _wt = weights_pl.filter(pl.col("hospitalization_id").is_in(_final_ids))
+
+    _idx = cohort_out.select(["hospitalization_id", "index_dttm", "med_category_ind", "med_category_par", "location_category"])
+
+    _wt_idx = _wt.join(_idx, on="hospitalization_id", how="inner")
+
+    # Last weight BEFORE RSI
+    _pre = (
+        _wt_idx
+        .filter(pl.col("recorded_dttm") <= pl.col("index_dttm"))
+        .with_columns(
+            ((pl.col("index_dttm") - pl.col("recorded_dttm")).dt.total_seconds() / 3600).alias("pre_weight_hours_before")
+        )
+        .sort("pre_weight_hours_before")
+        .group_by("hospitalization_id")
+        .first()
+        .select([
+            "hospitalization_id",
+            pl.col("recorded_dttm").alias("pre_weight_dttm"),
+            pl.col("vital_value").alias("pre_weight_kg"),
+            "pre_weight_hours_before",
+        ])
+    )
+
+    # First weight AFTER RSI
+    _post = (
+        _wt_idx
+        .filter(pl.col("recorded_dttm") > pl.col("index_dttm"))
+        .with_columns(
+            ((pl.col("recorded_dttm") - pl.col("index_dttm")).dt.total_seconds() / 3600).alias("post_weight_hours_after")
+        )
+        .sort("post_weight_hours_after")
+        .group_by("hospitalization_id")
+        .first()
+        .select([
+            "hospitalization_id",
+            pl.col("recorded_dttm").alias("post_weight_dttm"),
+            pl.col("vital_value").alias("post_weight_kg"),
+            "post_weight_hours_after",
+        ])
+    )
+
+    # Combine
+    weight_timing = (
+        _idx
+        .join(_pre, on="hospitalization_id", how="left")
+        .join(_post, on="hospitalization_id", how="left")
+        .with_columns([
+            ((pl.col("post_weight_dttm") - pl.col("pre_weight_dttm")).dt.total_seconds() / 3600).alias("pre_to_post_hours"),
+            (pl.col("post_weight_kg") - pl.col("pre_weight_kg")).alias("weight_change_kg"),
+            (pl.col("med_category_ind") + " + " + pl.col("med_category_par")).alias("med_pair"),
+        ])
+    )
+
+    # --- Aggregate stats ---
+    _metrics = ["pre_weight_hours_before", "post_weight_hours_after", "pre_to_post_hours", "weight_change_kg"]
+
+    def _agg_stats(df, group_col=None):
+        rows = []
+        if group_col is not None:
+            groups = df.select(group_col).unique().sort(group_col).to_series().to_list()
+        else:
+            groups = [None]
+        for g in groups:
+            sub = df if g is None else df.filter(pl.col(group_col) == g)
+            for m in _metrics:
+                vals = sub[m].drop_nulls()
+                if vals.len() == 0:
+                    continue
+                rows.append({
+                    "group_by": group_col or "overall",
+                    "group_value": g or "all",
+                    "metric": m,
+                    "n": vals.len(),
+                    "median": vals.median(),
+                    "mean": vals.mean(),
+                    "p25": vals.quantile(0.25),
+                    "p75": vals.quantile(0.75),
+                    "min": vals.min(),
+                    "max": vals.max(),
+                })
+        return rows
+
+    _all_rows = _agg_stats(weight_timing)
+    for _gcol in ["med_category_ind", "med_category_par", "location_category", "med_pair"]:
+        _all_rows.extend(_agg_stats(weight_timing, _gcol))
+
+    stats_df = pl.DataFrame(_all_rows)
+
+    # --- Save outputs ---
+    weight_timing.write_parquet(OUTPUT_DIR / "subanalysis_weight_timing.parquet")
+    stats_df.write_csv(OUTPUT_TO_SHARE_DIR / "subanalysis_weight_timing_stats.csv")
+    print(f"Weight timing parquet saved: {OUTPUT_DIR / 'subanalysis_weight_timing.parquet'}")
+    print(f"Weight timing stats CSV saved: {OUTPUT_TO_SHARE_DIR / 'subanalysis_weight_timing_stats.csv'}")
+    print(f"Weight timing records: {weight_timing.height:,} | With pre-weight: {weight_timing['pre_weight_kg'].drop_nulls().len():,} | With post-weight: {weight_timing['post_weight_kg'].drop_nulls().len():,}")
+
+    # --- Plots (2x2) ---
+    _fig, _axes = _plt.subplots(2, 2, figsize=(14, 10))
+
+    # Top-left: Hours before RSI of last pre-RSI weight
+    _pre_hrs = weight_timing["pre_weight_hours_before"].drop_nulls().to_list()
+    _axes[0, 0].hist(_pre_hrs, bins=50, edgecolor="black", alpha=0.7)
+    _axes[0, 0].set_xlabel("Hours Before RSI")
+    _axes[0, 0].set_ylabel("Count")
+    _axes[0, 0].set_title("Last Pre-RSI Weight: Hours Before Intubation")
+
+    # Top-right: Hours after RSI of first post-RSI weight
+    _post_hrs = weight_timing["post_weight_hours_after"].drop_nulls().to_list()
+    _axes[0, 1].hist(_post_hrs, bins=50, edgecolor="black", alpha=0.7, color="orange")
+    _axes[0, 1].set_xlabel("Hours After RSI")
+    _axes[0, 1].set_ylabel("Count")
+    _axes[0, 1].set_title("First Post-RSI Weight: Hours After Intubation")
+
+    # Bottom-left: Weight change (kg)
+    _wt_change = weight_timing["weight_change_kg"].drop_nulls().to_list()
+    if _wt_change:
+        _axes[1, 0].hist(_wt_change, bins=50, edgecolor="black", alpha=0.7, color="green")
+        _axes[1, 0].axvline(x=0, color="red", linestyle="--", linewidth=1.5)
+    _axes[1, 0].set_xlabel("Weight Change (kg)")
+    _axes[1, 0].set_ylabel("Count")
+    _axes[1, 0].set_title("Weight Change: Pre to Post RSI")
+
+    # Bottom-right: Box plot of weight change by med pair
+    _pairs = weight_timing.select(["med_pair", "weight_change_kg"]).drop_nulls()
+    _pair_labels = sorted(_pairs["med_pair"].unique().to_list())
+    _box_data = [_pairs.filter(pl.col("med_pair") == p)["weight_change_kg"].to_list() for p in _pair_labels]
+    if any(len(d) > 0 for d in _box_data):
+        _axes[1, 1].boxplot(_box_data, labels=_pair_labels, patch_artist=True)
+        _axes[1, 1].axhline(y=0, color="red", linestyle="--", linewidth=1)
+    _axes[1, 1].set_xlabel("Induction-Paralytic Pair")
+    _axes[1, 1].set_ylabel("Weight Change (kg)")
+    _axes[1, 1].set_title("Weight Change by Medication Pair")
+    _axes[1, 1].tick_params(axis="x", rotation=15)
+
+    _plt.tight_layout()
     mo.as_html(_fig)
     return
 
