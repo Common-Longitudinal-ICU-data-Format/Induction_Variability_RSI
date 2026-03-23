@@ -159,7 +159,6 @@ def _(DATA_DIR, FILETYPE, PatientProcedures, SITE, TIMEZONE, hosp_pl, pl):
     print(f"  - No CPT 31500: {n_no_cpt:,}")
     print(f"  - CPT 31500 but no billing provider: {n_cpt_no_provider:,}")
     return (
-        cpt_31500,
         hosp_with_cpt,
         n_after_cpt,
         n_cpt_no_provider,
@@ -366,7 +365,7 @@ def _(Adt, DATA_DIR, FILETYPE, TIMEZONE, pl, rsi_events):
     n_after_loc = rsi_events_loc.height
     n_excl_loc = rsi_events.height - n_after_loc
     print(f"After ED/ICU location: {n_after_loc:,} (excluded {n_excl_loc:,})")
-    return adt_pl, n_after_loc, n_excl_loc, rsi_events_loc, rsi_loc
+    return n_after_loc, n_excl_loc, rsi_events_loc, rsi_loc
 
 
 @app.cell
@@ -435,41 +434,10 @@ def _(mo):
 
 
 @app.cell
-def _(adt_pl, cohort_incl, cpt_31500, pl):
-    # Exclusion 1: CPT 31500 on same calendar day as location_category = 'procedural'
-    _cpt_cohort = cpt_31500.filter(
-        pl.col("hospitalization_id").is_in(cohort_incl["hospitalization_id"])
-    ).with_columns(pl.col("procedure_billed_dttm").dt.date().alias("cpt_date"))
-
-    _proc_loc = adt_pl.filter(pl.col("location_category") == "procedural").with_columns([
-        pl.col("in_dttm").dt.date().alias("proc_date_in"),
-        pl.col("out_dttm").dt.date().alias("proc_date_out"),
-    ])
-
-    _merged = _cpt_cohort.join(
-        _proc_loc.select(["hospitalization_id", "proc_date_in", "proc_date_out"]),
-        on="hospitalization_id",
-        how="inner",
-    ).filter(
-        (pl.col("cpt_date") >= pl.col("proc_date_in"))
-        & (pl.col("cpt_date") <= pl.col("proc_date_out"))
-    )
-
-    excl_procedural_ids = _merged["hospitalization_id"].unique()
-    cohort_e1 = cohort_incl.filter(
-        ~pl.col("hospitalization_id").is_in(excl_procedural_ids)
-    )
-    n_excl_e1 = cohort_incl.height - cohort_e1.height
-    n_after_e1 = cohort_e1.height
-    print(f"Excl 1 - Procedural location on CPT date: excluded {n_excl_e1:,}, remaining {n_after_e1:,}")
-    return cohort_e1, n_after_e1, n_excl_e1
-
-
-@app.cell
-def _(cohort_e1, hosp_pl, pl, procs_pl, resp_pl):
+def _(cohort_incl, hosp_pl, pl, procs_pl, resp_pl):
     # Exclusion 2: Tracheostomy within 24 hours of admission
     _hosp_adm = hosp_pl.select(["hospitalization_id", "admission_dttm"])
-    _cohort_ids = cohort_e1["hospitalization_id"]
+    _cohort_ids = cohort_incl["hospitalization_id"]
 
     # Check respiratory_support tracheostomy flag
     _trach_resp = (
@@ -505,8 +473,8 @@ def _(cohort_e1, hosp_pl, pl, procs_pl, resp_pl):
 
     # Combine
     _all_trach_ids = pl.concat([_excl_trach_resp, _excl_trach_proc]).unique()
-    cohort_e2 = cohort_e1.filter(~pl.col("hospitalization_id").is_in(_all_trach_ids))
-    n_excl_e2 = cohort_e1.height - cohort_e2.height
+    cohort_e2 = cohort_incl.filter(~pl.col("hospitalization_id").is_in(_all_trach_ids))
+    n_excl_e2 = cohort_incl.height - cohort_e2.height
     n_after_e2 = cohort_e2.height
     print(f"Excl 2 - Tracheostomy within 24h: excluded {n_excl_e2:,} (resp flag: {_excl_trach_resp.len()}, proc codes: {_excl_trach_proc.len()}), remaining {n_after_e2:,}")
     return cohort_e2, n_after_e2, n_excl_e2
@@ -752,7 +720,6 @@ def _(
     json,
     n_after_cpt,
     n_after_date,
-    n_after_e1,
     n_after_e2,
     n_after_e3,
     n_after_e4,
@@ -767,7 +734,6 @@ def _(
     n_excl_age,
     n_excl_cpt,
     n_excl_date,
-    n_excl_e1,
     n_excl_e2,
     n_excl_e3,
     n_excl_e4,
@@ -793,14 +759,13 @@ def _(
             {"step": 4, "description": "RSI pairing (induction + paralytic within 5 min)", "n_remaining": n_after_rsi, "n_excluded": n_excl_rsi, "exclusion_reason": "No valid RSI medication pair"},
             {"step": 5, "description": "ED or ICU location at RSI time", "n_remaining": n_after_loc, "n_excluded": n_excl_loc, "exclusion_reason": "Not in ED or ICU at RSI time"},
             {"step": 6, "description": "IMV within 6 hours of induction", "n_remaining": n_after_imv, "n_excluded": n_excl_imv, "exclusion_reason": "No IMV within 6 hours"},
-            {"step": 7, "description": "No procedural location on CPT 31500 date", "n_remaining": n_after_e1, "n_excluded": n_excl_e1, "exclusion_reason": "CPT 31500 on same day as procedural location"},
-            {"step": 8, "description": "No tracheostomy within 24h of admission", "n_remaining": n_after_e2, "n_excluded": n_excl_e2, "exclusion_reason": "Tracheostomy within 24h of admission"},
-            {"step": 9, "description": "Not both etomidate and ketamine", "n_remaining": n_after_e3, "n_excluded": n_excl_e3, "exclusion_reason": "Received both etomidate and ketamine"},
-            {"step": 10, "description": "No benzo/propofol within 60 min prior", "n_remaining": n_after_e4, "n_excluded": n_excl_e4, "exclusion_reason": "Benzo or propofol within 60 min prior to RSI"},
-            {"step": 11, "description": "Charted weight available", "n_remaining": n_after_e5, "n_excluded": n_excl_e5, "exclusion_reason": "No charted weight prior to intubation"},
-            {"step": 12, "description": "First RSI per hospitalization", "n_remaining": n_after_e6, "n_excluded": n_excl_e6, "exclusion_reason": "Prior intubation in same hospitalization"},
-            {"step": 13, "description": "Feasible induction dose", "n_remaining": n_after_e7, "n_excluded": n_excl_e7, "exclusion_reason": "Non-feasible etomidate or ketamine dose"},
-            {"step": 14, "description": "Physiological weight (20-300 kg)", "n_remaining": n_after_e8, "n_excluded": n_excl_e8, "exclusion_reason": "Non-physiological weight"},
+            {"step": 7, "description": "No tracheostomy within 24h of admission", "n_remaining": n_after_e2, "n_excluded": n_excl_e2, "exclusion_reason": "Tracheostomy within 24h of admission"},
+            {"step": 8, "description": "Not both etomidate and ketamine", "n_remaining": n_after_e3, "n_excluded": n_excl_e3, "exclusion_reason": "Received both etomidate and ketamine"},
+            {"step": 9, "description": "No benzo/propofol within 60 min prior", "n_remaining": n_after_e4, "n_excluded": n_excl_e4, "exclusion_reason": "Benzo or propofol within 60 min prior to RSI"},
+            {"step": 10, "description": "Charted weight available", "n_remaining": n_after_e5, "n_excluded": n_excl_e5, "exclusion_reason": "No charted weight prior to intubation"},
+            {"step": 11, "description": "First RSI per hospitalization", "n_remaining": n_after_e6, "n_excluded": n_excl_e6, "exclusion_reason": "Prior intubation in same hospitalization"},
+            {"step": 12, "description": "Feasible induction dose", "n_remaining": n_after_e7, "n_excluded": n_excl_e7, "exclusion_reason": "Non-feasible etomidate or ketamine dose"},
+            {"step": 13, "description": "Physiological weight (20-300 kg)", "n_remaining": n_after_e8, "n_excluded": n_excl_e8, "exclusion_reason": "Non-physiological weight"},
         ],
         "final_cohort": {
             "n_hospitalizations": cohort_out.height,
@@ -855,7 +820,7 @@ def _(cohort_out, consort_flow, mo, pl):
 
 
 @app.cell
-def _(cohort_out, mo, pl):
+def _(OUTPUT_TO_SHARE_DIR, cohort_out, mo, pl):
     import matplotlib.pyplot as _plt
     import numpy as _np
 
@@ -899,6 +864,9 @@ def _(cohort_out, mo, pl):
     _ax.legend()
     _plt.tight_layout()
 
+    _plots_dir = OUTPUT_TO_SHARE_DIR / "plots"
+    _plots_dir.mkdir(parents=True, exist_ok=True)
+    _fig.savefig(_plots_dir / "rsi_location_by_med_pair.png", dpi=150, bbox_inches="tight")
     mo.as_html(_fig)
     return
 
@@ -918,7 +886,10 @@ def _(OUTPUT_DIR, OUTPUT_TO_SHARE_DIR, cohort_out, mo, pl, weights_pl):
     # Last weight BEFORE RSI
     _pre = (
         _wt_idx
-        .filter(pl.col("recorded_dttm") <= pl.col("index_dttm"))
+        .filter(
+            (pl.col("recorded_dttm") <= pl.col("index_dttm"))
+            & (((pl.col("index_dttm") - pl.col("recorded_dttm")).dt.total_seconds() / 3600) <= 100)
+        )
         .with_columns(
             ((pl.col("index_dttm") - pl.col("recorded_dttm")).dt.total_seconds() / 3600).alias("pre_weight_hours_before")
         )
@@ -936,7 +907,10 @@ def _(OUTPUT_DIR, OUTPUT_TO_SHARE_DIR, cohort_out, mo, pl, weights_pl):
     # First weight AFTER RSI
     _post = (
         _wt_idx
-        .filter(pl.col("recorded_dttm") > pl.col("index_dttm"))
+        .filter(
+            (pl.col("recorded_dttm") > pl.col("index_dttm"))
+            & (((pl.col("recorded_dttm") - pl.col("index_dttm")).dt.total_seconds() / 3600) <= 100)
+        )
         .with_columns(
             ((pl.col("recorded_dttm") - pl.col("index_dttm")).dt.total_seconds() / 3600).alias("post_weight_hours_after")
         )
@@ -1025,7 +999,7 @@ def _(OUTPUT_DIR, OUTPUT_TO_SHARE_DIR, cohort_out, mo, pl, weights_pl):
     # Bottom-left: Weight change (kg)
     _wt_change = weight_timing["weight_change_kg"].drop_nulls().to_list()
     if _wt_change:
-        _axes[1, 0].hist(_wt_change, bins=50, edgecolor="black", alpha=0.7, color="green")
+        _axes[1, 0].hist(_wt_change, bins=range(int(min(_wt_change)), int(max(_wt_change)) + 2), edgecolor="black", alpha=0.7, color="green")
         _axes[1, 0].axvline(x=0, color="red", linestyle="--", linewidth=1.5)
     _axes[1, 0].set_xlabel("Weight Change (kg)")
     _axes[1, 0].set_ylabel("Count")
@@ -1044,6 +1018,166 @@ def _(OUTPUT_DIR, OUTPUT_TO_SHARE_DIR, cohort_out, mo, pl, weights_pl):
     _axes[1, 1].tick_params(axis="x", rotation=15)
 
     _plt.tight_layout()
+    _plots_dir = OUTPUT_TO_SHARE_DIR / "plots"
+    _plots_dir.mkdir(parents=True, exist_ok=True)
+    _fig.savefig(_plots_dir / "weight_timing.png", dpi=150, bbox_inches="tight")
+    mo.as_html(_fig)
+    return
+
+
+@app.cell
+def _(
+    DATA_DIR,
+    FILETYPE,
+    OUTPUT_TO_SHARE_DIR,
+    TIMEZONE,
+    Vitals,
+    cohort_e4,
+    cohort_e5,
+    hosp_pl,
+    mo,
+    pl,
+    weights_pl,
+):
+    import matplotlib.pyplot as _plt
+
+    # --- Sub-analysis: weight gap for patients excluded by no pre-RSI weight ---
+    _excl_ids = cohort_e4.filter(
+        ~pl.col("hospitalization_id").is_in(cohort_e5["hospitalization_id"])
+    )
+    _excl_with_patient = _excl_ids.select(["hospitalization_id", "index_dttm"]).join(
+        hosp_pl.select(["hospitalization_id", "patient_id", "admission_dttm"]),
+        on="hospitalization_id",
+        how="left",
+    )
+
+    # Find all prior hospitalizations within 1 year for these patients
+    _all_hosp = hosp_pl.select(["hospitalization_id", "patient_id", "admission_dttm"]).rename(
+        {"hospitalization_id": "prior_hosp_id", "admission_dttm": "prior_adm_dttm"}
+    )
+    _prior = (
+        _excl_with_patient.select(["hospitalization_id", "patient_id", "admission_dttm"])
+        .join(_all_hosp, on="patient_id", how="inner")
+        .filter(
+            (pl.col("prior_adm_dttm") < pl.col("admission_dttm"))
+            & (
+                (pl.col("admission_dttm") - pl.col("prior_adm_dttm")).dt.total_seconds()
+                <= 365.25 * 24 * 3600
+            )
+        )
+    )
+    _prior_hosp_ids = _prior["prior_hosp_id"].unique().to_list()
+
+    # Load weight data for prior hospitalizations
+    if _prior_hosp_ids:
+        _prior_vit = Vitals.from_file(
+            data_directory=DATA_DIR,
+            filetype=FILETYPE,
+            timezone=TIMEZONE,
+            filters={
+                "hospitalization_id": _prior_hosp_ids,
+                "vital_category": ["weight_kg"],
+            },
+        )
+        _prior_vit_pd = _prior_vit.df.copy()
+        _prior_vit_pd["recorded_dttm"] = _prior_vit_pd["recorded_dttm"].dt.tz_localize(None)
+        _prior_weights = pl.from_pandas(_prior_vit_pd).select(
+            ["hospitalization_id", "recorded_dttm", "vital_value"]
+        )
+        del _prior_vit_pd
+
+        # Map prior hospitalization weights back to current hospitalization via patient_id
+        _prior_mapped = (
+            _prior_weights.rename({"hospitalization_id": "prior_hosp_id"})
+            .join(
+                _prior.select(["hospitalization_id", "prior_hosp_id"]).unique(),
+                on="prior_hosp_id",
+                how="inner",
+            )
+            .select(["hospitalization_id", "recorded_dttm", "vital_value"])
+        )
+    else:
+        _prior_mapped = pl.DataFrame(
+            schema={"hospitalization_id": pl.Utf8, "recorded_dttm": pl.Datetime, "vital_value": pl.Float64}
+        )
+
+    # Current hospitalization weights for excluded patients
+    _curr_weights = weights_pl.filter(
+        pl.col("hospitalization_id").is_in(_excl_ids["hospitalization_id"])
+    ).select(["hospitalization_id", "recorded_dttm", "vital_value"])
+
+    # Combine all available weights
+    _all_weights = pl.concat([_curr_weights, _prior_mapped], how="diagonal_relaxed")
+
+    _idx = _excl_with_patient.select(["hospitalization_id", "index_dttm"])
+    _wt_idx = _all_weights.join(_idx, on="hospitalization_id", how="inner")
+
+    # Last weight BEFORE RSI (from any hospitalization within 1 year)
+    _pre = (
+        _wt_idx.filter(pl.col("recorded_dttm") < pl.col("index_dttm"))
+        .with_columns(
+            ((pl.col("index_dttm") - pl.col("recorded_dttm")).dt.total_seconds() / 3600)
+            .alias("hours_before")
+        )
+        .sort("hours_before")
+        .group_by("hospitalization_id")
+        .first()
+        .select([
+            "hospitalization_id",
+            pl.col("recorded_dttm").alias("pre_weight_dttm"),
+            pl.col("vital_value").alias("pre_weight_kg"),
+        ])
+    )
+
+    # First weight AFTER RSI (current hospitalization only)
+    _post = (
+        _curr_weights.join(_idx, on="hospitalization_id", how="inner")
+        .filter(pl.col("recorded_dttm") > pl.col("index_dttm"))
+        .with_columns(
+            ((pl.col("recorded_dttm") - pl.col("index_dttm")).dt.total_seconds() / 3600)
+            .alias("hours_after")
+        )
+        .sort("hours_after")
+        .group_by("hospitalization_id")
+        .first()
+        .select([
+            "hospitalization_id",
+            pl.col("recorded_dttm").alias("post_weight_dttm"),
+            pl.col("vital_value").alias("post_weight_kg"),
+        ])
+    )
+
+    # Combine and compute metrics
+    _merged = (
+        _idx.join(_pre, on="hospitalization_id", how="inner")
+        .join(_post, on="hospitalization_id", how="inner")
+        .with_columns([
+            ((pl.col("post_weight_dttm") - pl.col("pre_weight_dttm")).dt.total_seconds() / (24 * 3600))
+            .alias("time_diff_days"),
+            (pl.col("post_weight_kg") - pl.col("pre_weight_kg")).alias("weight_diff_kg"),
+        ])
+    )
+
+    _n_excl = _excl_ids.height
+    _n_with_both = _merged.height
+    print(f"Weight gap sub-analysis: {_n_excl} excluded patients, {_n_with_both} with both pre (1yr lookback) and post-RSI weights")
+
+    # Scatter plot
+    _fig, _ax = _plt.subplots(figsize=(10, 7))
+    if _merged.height > 0:
+        _x = _merged["time_diff_days"].to_list()
+        _y = _merged["weight_diff_kg"].to_list()
+        _ax.scatter(_x, _y, alpha=0.5, edgecolors="black", linewidths=0.3, s=30,
+                    label=f"With both weights (n={_n_with_both})")
+        _ax.axhline(y=0, color="red", linestyle="--", linewidth=1)
+    _ax.legend(title=f"Total excluded: {_n_excl}")
+    _ax.set_xlabel("Time Between Last Pre-RSI Weight and First Post-RSI Weight (days)")
+    _ax.set_ylabel("Weight Difference: Post - Pre (kg)")
+    _ax.set_title("Weight Gap for Excluded Patients (No Pre-RSI Weight During Hospitalization)")
+    _plt.tight_layout()
+    _plots_dir = OUTPUT_TO_SHARE_DIR / "plots"
+    _plots_dir.mkdir(parents=True, exist_ok=True)
+    _fig.savefig(_plots_dir / "weight_gap_excluded.png", dpi=150, bbox_inches="tight")
     mo.as_html(_fig)
     return
 

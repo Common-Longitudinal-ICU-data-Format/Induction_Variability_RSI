@@ -70,7 +70,7 @@ def _(Path, json):
     print(f"Site: {SITE}")
     print(f"Data directory: {DATA_DIR}")
     print(f"Output (PHI): {OUTPUT_DIR}")
-    return DATA_DIR, FILETYPE, OUTPUT_DIR, TIMEZONE
+    return DATA_DIR, FILETYPE, OUTPUT_DIR, SITE, TIMEZONE
 
 
 @app.cell
@@ -357,8 +357,27 @@ def _(DATA_DIR, FILETYPE, TIMEZONE, cohort, compute_ase, pl):
     )
 
     _ase_ids = _ase_check["hospitalization_id"].unique()
+
+    # Presumed infection within 7 days prior
+    _infection_check = (
+        cohort.select(["hospitalization_id", "index_dttm"])
+        .join(
+            ase_pl.filter(pl.col("presumed_infection") == 1)
+            .select(["hospitalization_id", "presumed_infection_onset_dttm"]),
+            on="hospitalization_id",
+            how="inner",
+        )
+        .with_columns(
+            ((pl.col("index_dttm") - pl.col("presumed_infection_onset_dttm")).dt.total_seconds() / 86400)
+            .alias("days_before")
+        )
+        .filter((pl.col("days_before") >= 0) & (pl.col("days_before") <= 7))
+    )
+    _infection_ids = _infection_check["hospitalization_id"].unique()
+
     ase_df = cohort.select("hospitalization_id").with_columns(
-        pl.col("hospitalization_id").is_in(_ase_ids).cast(pl.Int8).alias("ASE_7d_prior")
+        pl.col("hospitalization_id").is_in(_ase_ids).cast(pl.Int8).alias("ASE_7d_prior"),
+        pl.col("hospitalization_id").is_in(_infection_ids).cast(pl.Int8).alias("presumed_infection_7d_prior"),
     )
 
     print(f"ASE 7d prior: {ase_df['ASE_7d_prior'].sum()} hospitalizations")
@@ -558,6 +577,10 @@ def _(DATA_DIR, FILETYPE, MedicationAdminContinuous, TIMEZONE, cohort, pl):
                 pl.col("med_dose").max().alias(f"{med}_dose_{suffix}")
             )
             out = out.join(_max_dose, on="hospitalization_id", how="left")
+        out = out.with_columns(
+            pl.max_horizontal([f"any_vasopressor_{med}_{suffix}" for med in VASOPRESSORS])
+              .alias(f"any_vasopressor_{suffix}")
+        )
         return out
 
     vaso_24hr = _compute_vaso_window(_vaso_joined, 24, "24hrs_prior")
@@ -587,6 +610,7 @@ def _(Adt, DATA_DIR, FILETYPE, PatientProcedures, TIMEZONE, cohort, pl):
     adt_pl = adt_pl.with_columns(
         pl.col("location_category").str.to_lowercase().alias("location_category"),
         pl.col("location_type").str.to_lowercase().alias("location_type"),
+        pl.col("hospital_type").str.to_lowercase().alias("hospital_type"),
     )
 
     # Location at intubation (index_dttm)
@@ -604,6 +628,7 @@ def _(Adt, DATA_DIR, FILETYPE, PatientProcedures, TIMEZONE, cohort, pl):
               .then(pl.col("location_type"))
               .otherwise(pl.lit(None))
               .alias("icu_type"),
+            "hospital_type",
         ])
         .group_by("hospitalization_id").first()
     )
@@ -746,6 +771,51 @@ def _(
     - **Rows:** {dataset.height:,}
     - **Columns:** {len(dataset.columns)}
     - **Saved to:** `{OUTPUT_DIR / 'rsi_analytical_dataset.parquet'}`
+    """)
+    return (dataset,)
+
+
+@app.cell
+def _(OUTPUT_DIR, SITE, dataset, mo, pl):
+    # Analysis Dataset 2: focused variable set for modeling
+    analysis_2 = dataset.select([
+        "hospitalization_id",
+        pl.col("med_dose_ind").alias("induction_dose_mg"),
+        pl.col("induction_dose_per_kg").alias("dose_mg_kg"),
+        pl.col("med_category_ind").alias("drug_received"),
+        pl.col("age_at_admission").alias("age_years"),
+        "sex_category",
+        "race_category",
+        "ethnicity_category",
+        "cci",
+        "ASE_7d_prior",
+        "presumed_infection_7d_prior",
+        pl.col("lowest_sbp_24hrs_prior").alias("worst_sbp_24hr_pre"),
+        pl.col("highest_hr_24hrs_prior").alias("worst_hr_24hr_pre"),
+        pl.col("lowest_spo2_24hrs_prior").alias("worst_spo2_24hr_pre"),
+        "any_vasopressor_24hrs_prior",
+        "any_vasopressor_1hr_prior",
+        "location_at_intubation",
+        "icu_type",
+        "hospital_type",
+        pl.col("index_dttm").dt.year().cast(pl.Int16).alias("calendar_year"),
+        pl.col("index_dttm").dt.quarter().cast(pl.Int8).alias("calendar_quarter"),
+        pl.lit(SITE).alias("site_id"),
+        "provider_id",
+        "weight_kg",
+    ])
+
+    analysis_2.write_parquet(OUTPUT_DIR / "rsi_analysis_dataset_2.parquet")
+
+    print(f"Analysis Dataset 2: {analysis_2.height:,} rows, {len(analysis_2.columns)} columns")
+    print(f"Saved to: {OUTPUT_DIR / 'rsi_analysis_dataset_2.parquet'}")
+
+    mo.md(f"""
+    ## Analysis Dataset 2
+
+    - **Rows:** {analysis_2.height:,}
+    - **Columns:** {len(analysis_2.columns)}
+    - **Saved to:** `{OUTPUT_DIR / 'rsi_analysis_dataset_2.parquet'}`
     """)
     return
 
