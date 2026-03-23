@@ -536,8 +536,8 @@ def _(cohort_e3, meds_pl, pl):
 
 
 @app.cell
-def _(DATA_DIR, FILETYPE, TIMEZONE, Vitals, cohort_e4, pl):
-    # Exclusion 5: No charted weight available prior to intubation
+def _(DATA_DIR, FILETYPE, TIMEZONE, Vitals, cohort_e4, hosp_pl, pl):
+    # Weight lookup: current hospitalization first, then 28-day lookback across prior hospitalizations
     vitals_table = Vitals.from_file(
         data_directory=DATA_DIR,
         filetype=FILETYPE,
@@ -556,8 +556,8 @@ def _(DATA_DIR, FILETYPE, TIMEZONE, Vitals, cohort_e4, pl):
         pl.col("vital_category").str.to_lowercase().alias("vital_category")
     )
 
-    # Find closest weight prior to index_dttm
-    _wt_check = (
+    # Step 1: Find closest weight prior to index_dttm in current hospitalization
+    _wt_current = (
         cohort_e4.select(["hospitalization_id", "index_dttm"])
         .join(
             weights_pl.select(["hospitalization_id", "recorded_dttm", "vital_value"]),
@@ -571,18 +571,126 @@ def _(DATA_DIR, FILETYPE, TIMEZONE, Vitals, cohort_e4, pl):
         .sort("secs_before")
         .group_by("hospitalization_id")
         .first()
-        .select(["hospitalization_id", pl.col("vital_value").alias("weight_kg")])
+        .select([
+            "hospitalization_id",
+            pl.col("vital_value").alias("weight_kg"),
+            pl.col("recorded_dttm").alias("weight_recorded_dttm"),
+            pl.lit("current_hospitalization").alias("weight_source"),
+        ])
+    )
+    _has_current = _wt_current["hospitalization_id"]
+
+    # Step 2: For patients without current-hospitalization weight, look back 28 days
+    _no_current = cohort_e4.filter(~pl.col("hospitalization_id").is_in(_has_current))
+    _no_current_with_patient = _no_current.select(["hospitalization_id", "index_dttm"]).join(
+        hosp_pl.select(["hospitalization_id", "patient_id", "admission_dttm"]),
+        on="hospitalization_id",
+        how="left",
     )
 
-    has_weight_ids = _wt_check["hospitalization_id"]
-    cohort_e5 = (
-        cohort_e4.filter(pl.col("hospitalization_id").is_in(has_weight_ids))
-        .join(_wt_check, on="hospitalization_id", how="left")
+    _all_hosp = hosp_pl.select(["hospitalization_id", "patient_id", "admission_dttm"]).rename(
+        {"hospitalization_id": "prior_hosp_id", "admission_dttm": "prior_adm_dttm"}
     )
-    n_excl_e5 = cohort_e4.height - cohort_e5.height
-    n_after_e5 = cohort_e5.height
-    print(f"Excl 5 - No charted weight: excluded {n_excl_e5:,}, remaining {n_after_e5:,}")
-    return cohort_e5, n_after_e5, n_excl_e5, weights_pl
+    _prior = (
+        _no_current_with_patient.select(["hospitalization_id", "patient_id", "admission_dttm", "index_dttm"])
+        .join(_all_hosp, on="patient_id", how="inner")
+        .filter(
+            (pl.col("prior_adm_dttm") < pl.col("admission_dttm"))
+            & (
+                (pl.col("admission_dttm") - pl.col("prior_adm_dttm")).dt.total_seconds()
+                <= 28 * 24 * 3600
+            )
+        )
+    )
+    _prior_hosp_ids = _prior["prior_hosp_id"].unique().to_list()
+
+    if _prior_hosp_ids:
+        _prior_vit = Vitals.from_file(
+            data_directory=DATA_DIR,
+            filetype=FILETYPE,
+            timezone=TIMEZONE,
+            filters={
+                "hospitalization_id": _prior_hosp_ids,
+                "vital_category": ["weight_kg"],
+            },
+        )
+        _prior_vit_pd = _prior_vit.df.copy()
+        _prior_vit_pd["recorded_dttm"] = _prior_vit_pd["recorded_dttm"].dt.tz_localize(None)
+        _prior_weights = pl.from_pandas(_prior_vit_pd).select(
+            ["hospitalization_id", "recorded_dttm", "vital_value"]
+        )
+        del _prior_vit_pd
+
+        # Map prior hospitalization weights back to current hospitalization
+        _prior_mapped = (
+            _prior_weights.rename({"hospitalization_id": "prior_hosp_id"})
+            .join(
+                _prior.select(["hospitalization_id", "prior_hosp_id", "index_dttm"]).unique(),
+                on="prior_hosp_id",
+                how="inner",
+            )
+        )
+
+        # Find latest weight from prior hospitalizations (before current RSI)
+        _wt_prior = (
+            _prior_mapped
+            .filter(pl.col("recorded_dttm") <= pl.col("index_dttm"))
+            .with_columns(
+                (pl.col("index_dttm") - pl.col("recorded_dttm")).dt.total_seconds().alias("secs_before")
+            )
+            .sort("secs_before")
+            .group_by("hospitalization_id")
+            .first()
+            .select([
+                "hospitalization_id",
+                pl.col("vital_value").alias("weight_kg"),
+                pl.col("recorded_dttm").alias("weight_recorded_dttm"),
+                pl.lit("previous_hospitalization_weight_28days").alias("weight_source"),
+            ])
+        )
+    else:
+        _wt_prior = pl.DataFrame(
+            schema={
+                "hospitalization_id": pl.Utf8,
+                "weight_kg": pl.Float64,
+                "weight_recorded_dttm": pl.Datetime,
+                "weight_source": pl.Utf8,
+            }
+        )
+
+    # Step 3: Combine all weight sources
+    _wt_all = pl.concat([_wt_current, _wt_prior], how="diagonal_relaxed")
+    _has_any_weight = _wt_all["hospitalization_id"]
+
+    # Step 4: Patients with no weight at all
+    _no_weight = (
+        cohort_e4.filter(~pl.col("hospitalization_id").is_in(_has_any_weight))
+        .select(["hospitalization_id"])
+        .with_columns([
+            pl.lit(None, dtype=pl.Float64).alias("weight_kg"),
+            pl.lit(None, dtype=pl.Datetime).alias("weight_recorded_dttm"),
+            pl.lit("no_weight").alias("weight_source"),
+        ])
+    )
+
+    _wt_final = pl.concat([_wt_all, _no_weight], how="diagonal_relaxed")
+
+    # Add weight_to_rsi_hours
+    cohort_e5 = (
+        cohort_e4.join(_wt_final, on="hospitalization_id", how="left")
+        .with_columns(
+            pl.when(pl.col("weight_recorded_dttm").is_not_null())
+            .then((pl.col("index_dttm") - pl.col("weight_recorded_dttm")).dt.total_seconds() / 3600)
+            .otherwise(None)
+            .alias("weight_to_rsi_hours")
+        )
+    )
+
+    _n_current = _wt_current.height
+    _n_prior = _wt_prior.height
+    _n_none = _no_weight.height
+    print(f"Weight sources: current_hospitalization={_n_current:,}, previous_28days={_n_prior:,}, no_weight={_n_none:,}")
+    return cohort_e5, weights_pl
 
 
 @app.cell
@@ -623,9 +731,10 @@ def _(cohort_e6, pl):
 
 @app.cell
 def _(cohort_e7, pl):
-    # Exclusion 9: Non-physiological weight (<20 kg or >300 kg)
+    # Exclusion 9: Non-physiological weight (<20 kg or >300 kg) — null weights pass through
     cohort_final = cohort_e7.filter(
-        (pl.col("weight_kg") >= 20) & (pl.col("weight_kg") <= 300)
+        pl.col("weight_kg").is_null()
+        | ((pl.col("weight_kg") >= 20) & (pl.col("weight_kg") <= 300))
     )
     n_excl_e8 = cohort_e7.height - cohort_final.height
     n_after_e8 = cohort_final.height
@@ -687,6 +796,9 @@ def _(
         "med_dose_par",
         "med_dose_unit_par",
         "weight_kg",
+        "weight_source",
+        "weight_recorded_dttm",
+        "weight_to_rsi_hours",
     ])
 
     _loc_lookup = (
@@ -723,7 +835,6 @@ def _(
     n_after_e2,
     n_after_e3,
     n_after_e4,
-    n_after_e5,
     n_after_e6,
     n_after_e7,
     n_after_e8,
@@ -737,7 +848,6 @@ def _(
     n_excl_e2,
     n_excl_e3,
     n_excl_e4,
-    n_excl_e5,
     n_excl_e6,
     n_excl_e7,
     n_excl_e8,
@@ -762,10 +872,9 @@ def _(
             {"step": 7, "description": "No tracheostomy within 24h of admission", "n_remaining": n_after_e2, "n_excluded": n_excl_e2, "exclusion_reason": "Tracheostomy within 24h of admission"},
             {"step": 8, "description": "Not both etomidate and ketamine", "n_remaining": n_after_e3, "n_excluded": n_excl_e3, "exclusion_reason": "Received both etomidate and ketamine"},
             {"step": 9, "description": "No benzo/propofol within 60 min prior", "n_remaining": n_after_e4, "n_excluded": n_excl_e4, "exclusion_reason": "Benzo or propofol within 60 min prior to RSI"},
-            {"step": 10, "description": "Charted weight available", "n_remaining": n_after_e5, "n_excluded": n_excl_e5, "exclusion_reason": "No charted weight prior to intubation"},
-            {"step": 11, "description": "First RSI per hospitalization", "n_remaining": n_after_e6, "n_excluded": n_excl_e6, "exclusion_reason": "Prior intubation in same hospitalization"},
-            {"step": 12, "description": "Feasible induction dose", "n_remaining": n_after_e7, "n_excluded": n_excl_e7, "exclusion_reason": "Non-feasible etomidate or ketamine dose"},
-            {"step": 13, "description": "Physiological weight (20-300 kg)", "n_remaining": n_after_e8, "n_excluded": n_excl_e8, "exclusion_reason": "Non-physiological weight"},
+            {"step": 10, "description": "First RSI per hospitalization", "n_remaining": n_after_e6, "n_excluded": n_excl_e6, "exclusion_reason": "Prior intubation in same hospitalization"},
+            {"step": 11, "description": "Feasible induction dose", "n_remaining": n_after_e7, "n_excluded": n_excl_e7, "exclusion_reason": "Non-feasible etomidate or ketamine dose"},
+            {"step": 12, "description": "Physiological weight (20-300 kg)", "n_remaining": n_after_e8, "n_excluded": n_excl_e8, "exclusion_reason": "Non-physiological weight"},
         ],
         "final_cohort": {
             "n_hospitalizations": cohort_out.height,

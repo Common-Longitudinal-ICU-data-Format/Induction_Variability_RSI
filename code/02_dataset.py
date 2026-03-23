@@ -107,6 +107,9 @@ def _(cohort, pl):
         "med_dose_par",
         "med_dose_unit_par",
         "weight_kg",
+        "weight_source",
+        "weight_recorded_dttm",
+        "weight_to_rsi_hours",
         "induction_dose_per_kg",
     ])
 
@@ -803,6 +806,9 @@ def _(OUTPUT_DIR, SITE, dataset, mo, pl):
         pl.lit(SITE).alias("site_id"),
         "provider_id",
         "weight_kg",
+        "weight_source",
+        "weight_recorded_dttm",
+        "weight_to_rsi_hours",
     ])
 
     analysis_2.write_parquet(OUTPUT_DIR / "rsi_analysis_dataset_2.parquet")
