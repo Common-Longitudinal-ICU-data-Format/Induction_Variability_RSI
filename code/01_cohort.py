@@ -594,13 +594,7 @@ def _(DATA_DIR, FILETYPE, TIMEZONE, Vitals, cohort_e4, hosp_pl, pl):
     _prior = (
         _no_current_with_patient.select(["hospitalization_id", "patient_id", "admission_dttm", "index_dttm"])
         .join(_all_hosp, on="patient_id", how="inner")
-        .filter(
-            (pl.col("prior_adm_dttm") < pl.col("admission_dttm"))
-            & (
-                (pl.col("admission_dttm") - pl.col("prior_adm_dttm")).dt.total_seconds()
-                <= 28 * 24 * 3600
-            )
-        )
+        .filter(pl.col("prior_adm_dttm") < pl.col("admission_dttm"))
     )
     _prior_hosp_ids = _prior["prior_hosp_id"].unique().to_list()
 
@@ -645,7 +639,7 @@ def _(DATA_DIR, FILETYPE, TIMEZONE, Vitals, cohort_e4, hosp_pl, pl):
                 "hospitalization_id",
                 pl.col("vital_value").alias("weight_kg"),
                 pl.col("recorded_dttm").alias("weight_recorded_dttm"),
-                pl.lit("previous_hospitalization_weight_28days").alias("weight_source"),
+                pl.lit("previous_hospitalization").alias("weight_source"),
             ])
         )
     else:
@@ -686,10 +680,37 @@ def _(DATA_DIR, FILETYPE, TIMEZONE, Vitals, cohort_e4, hosp_pl, pl):
         )
     )
 
+    # Post-RSI weight: first weight after index_dttm in current hospitalization
+    _post_rsi = (
+        cohort_e5.select(["hospitalization_id", "index_dttm"])
+        .join(
+            weights_pl.select(["hospitalization_id", "recorded_dttm", "vital_value"]),
+            on="hospitalization_id",
+            how="inner",
+        )
+        .filter(pl.col("recorded_dttm") > pl.col("index_dttm"))
+        .with_columns(
+            (pl.col("recorded_dttm") - pl.col("index_dttm")).dt.total_seconds().alias("secs_after")
+        )
+        .sort("secs_after")
+        .group_by("hospitalization_id")
+        .first()
+        .select([
+            "hospitalization_id",
+            pl.col("vital_value").alias("post_rsi_weight_kg"),
+            pl.col("recorded_dttm").alias("post_rsi_weight_recorded_dttm"),
+            (pl.col("secs_after") / 3600).alias("post_rsi_weight_to_rsi_hours"),
+        ])
+    )
+
+    cohort_e5 = cohort_e5.join(_post_rsi, on="hospitalization_id", how="left")
+
     _n_current = _wt_current.height
     _n_prior = _wt_prior.height
     _n_none = _no_weight.height
-    print(f"Weight sources: current_hospitalization={_n_current:,}, previous_28days={_n_prior:,}, no_weight={_n_none:,}")
+    _n_post = _post_rsi.height
+    print(f"Weight sources: current_hospitalization={_n_current:,}, previous_hospitalization={_n_prior:,}, no_weight={_n_none:,}")
+    print(f"Post-RSI weight available: {_n_post:,} / {cohort_e5.height:,}")
     return cohort_e5, weights_pl
 
 
@@ -799,6 +820,9 @@ def _(
         "weight_source",
         "weight_recorded_dttm",
         "weight_to_rsi_hours",
+        "post_rsi_weight_kg",
+        "post_rsi_weight_recorded_dttm",
+        "post_rsi_weight_to_rsi_hours",
     ])
 
     _loc_lookup = (

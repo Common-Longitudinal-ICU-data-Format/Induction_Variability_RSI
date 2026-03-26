@@ -110,6 +110,9 @@ def _(cohort, pl):
         "weight_source",
         "weight_recorded_dttm",
         "weight_to_rsi_hours",
+        "post_rsi_weight_kg",
+        "post_rsi_weight_recorded_dttm",
+        "post_rsi_weight_to_rsi_hours",
         "induction_dose_per_kg",
     ])
 
@@ -809,6 +812,9 @@ def _(OUTPUT_DIR, SITE, dataset, mo, pl):
         "weight_source",
         "weight_recorded_dttm",
         "weight_to_rsi_hours",
+        "post_rsi_weight_kg",
+        "post_rsi_weight_recorded_dttm",
+        "post_rsi_weight_to_rsi_hours",
     ])
 
     analysis_2.write_parquet(OUTPUT_DIR / "rsi_analysis_dataset_2.parquet")
