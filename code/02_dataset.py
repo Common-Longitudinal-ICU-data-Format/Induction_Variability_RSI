@@ -289,8 +289,30 @@ def _(DATA_DIR, FILETYPE, TIMEZONE, cohort, compute_sofa_polars, pl):
         pl.col("sofa_total").alias("sofa_24hr_prior_intubation"),
     ])
 
+    # SOFA 6hr window
+    sofa_cohort_6hr = cohort.select([
+        "hospitalization_id",
+        (pl.col("index_dttm") - pl.duration(hours=6)).alias("start_dttm"),
+        pl.col("index_dttm").alias("end_dttm"),
+    ])
+
+    sofa_result_6hr = compute_sofa_polars(
+        data_directory=DATA_DIR,
+        cohort_df=sofa_cohort_6hr,
+        filetype=FILETYPE,
+        timezone=TIMEZONE,
+    )
+
+    sofa_6hr_df = sofa_result_6hr.select([
+        "hospitalization_id",
+        pl.col("sofa_total").alias("sofa_6hr_prior_intubation"),
+    ])
+
+    sofa_df = sofa_df.join(sofa_6hr_df, on="hospitalization_id", how="outer_coalesce")
+
     print(f"SOFA computed for {sofa_df.height:,} hospitalizations")
-    print(f"  Median SOFA: {sofa_df['sofa_24hr_prior_intubation'].median()}")
+    print(f"  Median SOFA 24hr: {sofa_df['sofa_24hr_prior_intubation'].median()}")
+    print(f"  Median SOFA 6hr: {sofa_df['sofa_6hr_prior_intubation'].median()}")
     return (sofa_df,)
 
 
@@ -323,11 +345,16 @@ def _(CrrtTherapy, DATA_DIR, FILETYPE, TIMEZONE, cohort, pl):
     )
 
     _crrt_ids = _crrt_check["hospitalization_id"].unique()
+
+    _crrt_ids_6hr = _crrt_check.filter(pl.col("hours_before") <= 6)["hospitalization_id"].unique()
+
     crrt_df = cohort.select("hospitalization_id").with_columns(
-        pl.col("hospitalization_id").is_in(_crrt_ids).cast(pl.Int8).alias("crrt_24hr_prior_intubation")
+        pl.col("hospitalization_id").is_in(_crrt_ids).cast(pl.Int8).alias("crrt_24hr_prior_intubation"),
+        pl.col("hospitalization_id").is_in(_crrt_ids_6hr).cast(pl.Int8).alias("crrt_6hr_prior_intubation"),
     )
 
     print(f"CRRT 24hr prior: {crrt_df['crrt_24hr_prior_intubation'].sum()} hospitalizations")
+    print(f"CRRT 6hr prior: {crrt_df['crrt_6hr_prior_intubation'].sum()} hospitalizations")
     return (crrt_df,)
 
 
@@ -449,8 +476,13 @@ def _(DATA_DIR, FILETYPE, TIMEZONE, Vitals, cohort, pl):
         return out
 
     vitals_24hr = _compute_vitals_window(_vit_joined, 24, "24hrs_prior")
+    vitals_6hr = _compute_vitals_window(_vit_joined, 6, "6hrs_prior")
     vitals_1hr = _compute_vitals_window(_vit_joined, 1, "1hr_prior")
-    vitals_df = vitals_24hr.join(vitals_1hr, on="hospitalization_id", how="outer_coalesce")
+    vitals_df = (
+        vitals_24hr
+        .join(vitals_6hr, on="hospitalization_id", how="outer_coalesce")
+        .join(vitals_1hr, on="hospitalization_id", how="outer_coalesce")
+    )
 
     print(f"Vitals computed for {vitals_df.height:,} hospitalizations")
     print(f"  Columns: {vitals_df.columns}")
@@ -525,8 +557,13 @@ def _(DATA_DIR, FILETYPE, RespiratorySupport, TIMEZONE, cohort, pl):
         return highest.join(flags, on="hospitalization_id", how="outer_coalesce")
 
     resp_24hr = _compute_resp_window(_resp_joined, 24, "24hrs_prior")
+    resp_6hr = _compute_resp_window(_resp_joined, 6, "6hrs_prior")
     resp_1hr = _compute_resp_window(_resp_joined, 1, "1hr_prior")
-    resp_df = resp_24hr.join(resp_1hr, on="hospitalization_id", how="outer_coalesce")
+    resp_df = (
+        resp_24hr
+        .join(resp_6hr, on="hospitalization_id", how="outer_coalesce")
+        .join(resp_1hr, on="hospitalization_id", how="outer_coalesce")
+    )
 
     print(f"Respiratory support computed for {resp_df.height:,} hospitalizations")
     print(f"  Columns: {resp_df.columns}")
@@ -590,8 +627,13 @@ def _(DATA_DIR, FILETYPE, MedicationAdminContinuous, TIMEZONE, cohort, pl):
         return out
 
     vaso_24hr = _compute_vaso_window(_vaso_joined, 24, "24hrs_prior")
+    vaso_6hr = _compute_vaso_window(_vaso_joined, 6, "6hrs_prior")
     vaso_1hr = _compute_vaso_window(_vaso_joined, 1, "1hr_prior")
-    vaso_df = vaso_24hr.join(vaso_1hr, on="hospitalization_id", how="outer_coalesce")
+    vaso_df = (
+        vaso_24hr
+        .join(vaso_6hr, on="hospitalization_id", how="outer_coalesce")
+        .join(vaso_1hr, on="hospitalization_id", how="outer_coalesce")
+    )
 
     print(f"Vasopressors computed for {vaso_df.height:,} hospitalizations")
     print(f"  Columns: {vaso_df.columns}")
@@ -800,6 +842,10 @@ def _(OUTPUT_DIR, SITE, dataset, mo, pl):
         pl.col("highest_hr_24hrs_prior").alias("worst_hr_24hr_pre"),
         pl.col("lowest_spo2_24hrs_prior").alias("worst_spo2_24hr_pre"),
         "any_vasopressor_24hrs_prior",
+        pl.col("lowest_sbp_6hrs_prior").alias("worst_sbp_6hr_pre"),
+        pl.col("highest_hr_6hrs_prior").alias("worst_hr_6hr_pre"),
+        pl.col("lowest_spo2_6hrs_prior").alias("worst_spo2_6hr_pre"),
+        "any_vasopressor_6hrs_prior",
         "any_vasopressor_1hr_prior",
         "location_at_intubation",
         "icu_type",
