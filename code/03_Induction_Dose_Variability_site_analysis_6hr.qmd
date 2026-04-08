@@ -1,0 +1,1769 @@
+---
+title: "Induction Dose Variability Study"
+subtitle: "Site-Level Analysis — 6-Hour Window Version (v0.9_6hr)"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-summary: "Show code"
+    theme: cosmo
+    embed-resources: true
+    fig-width: 12
+    fig-height: 7
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+This document implements the pre-specified site-level analysis for the **Induction Dose Variability Study** (CLIF Consortium). Sites should run this document from top to bottom without modification except for the site configuration block in Section 0.
+
+
+**Study Design:**
+
+- **Primary aim:** Quantify the relative contribution of patient, provider, and hospital factors to variability in induction dose (mg/kg) of etomidate or ketamine during RSI
+- **Primary outcome:** Weight-normalized induction dose (mg/kg), continuous
+- **Method:** Linear mixed-effects model with variance decomposition (VPC); median odds ratio for binary outcomes
+- **Analytic window:** Peri-intubation vitals from 6 hours prior to RSI
+
+**Required data file:** Parquet file specified in `data_path` below (Section 0)
+
+**Required variables:**
+
+| Variable | Description |
+|---|---|
+| `hospitalization_id` | Unique hospitalization identifier |
+| `hospital_id` | Facility identifier |
+| `provider_id` | Billing provider identifier |
+| `drug` | Induction agent (etomidate / ketamine) |
+| `induction_dose_mg` | Total administered dose (mg) |
+| `dose_mg_kg` | Weight-normalized dose (mg/kg) |
+| `weight_kg` | Body weight (kg) |
+| `age_years`, `sex_category`, `race_category`, `ethnicity_category` | Demographics |
+| `cci` | Charlson Comorbidity Index |
+| `worst_sbp_6hr_pre`, `worst_hr_6hr_pre`, `worst_spo2_6hr_pre` | Worst vitals in 6hr pre-RSI |
+| `worst_sbp_24hr_pre`, `worst_hr_24hr_pre`, `worst_spo2_24hr_pre` | Worst vitals in 24hr pre-RSI (descriptive only) |
+| `any_vasopressor_6hrs_prior` | Vasopressor use in 6hr pre-RSI (models) |
+| `any_vasopressor_24hrs_prior`, `any_vasopressor_1hr_prior` | Vasopressor use (descriptive) |
+| `ASE_7d_prior`, `presumed_infection_7d_prior` | Sepsis/infection flags |
+| `location_at_intubation`, `icu_type` | Intubation location |
+| `hospital_type` | Facility type |
+| `calendar_year`, `calendar_quarter` | Time variables |
+| `weight_source`, `weight_recorded_dttm`, `weight_to_rsi_hours` | Weight provenance |
+
+---
+
+# Section 0 — Setup
+
+::: {.callout-important}
+**Site configuration required.** Fill in `SITE_ID` and `data_path` below. No other modifications are needed.
+:::
+
+```{r setup}
+# Install any missing packages before running:
+# install.packages(c("tidyverse","lme4","lmerTest","broom.mixed","boot",
+#                    "gtsummary","here","arrow","mice","patchwork","scales"))
+
+library(tidyverse)
+library(dplyr)
+library(lme4)
+library(lmerTest)
+library(broom.mixed)
+library(boot)
+library(gtsummary)
+library(here)
+library(arrow)
+library(mice)
+library(patchwork)
+library(scales)
+
+# ---- SITE CONFIGURATION — auto-loaded from clif_config.json ----------------
+cfg       <- jsonlite::fromJSON(here("clif_config.json"))
+SITE_ID   <- cfg$site_name
+data_path <- file.path(here(), cfg$output_directory, "rsi_analysis_dataset_2.parquet")
+# ----------------------------------------------------------------------------
+
+prefer_3level           <- TRUE
+min_encounters_hospital <- 50
+min_encounters_provider <- 10
+
+# Output directories
+dir.create(here("output_to_share_6hr/figures"),     showWarnings = FALSE, recursive = TRUE)
+dir.create(here("output_to_share_6hr/tables"),      showWarnings = FALSE, recursive = TRUE)
+dir.create(here("output_to_share_6hr/diagnostics"), showWarnings = FALSE, recursive = TRUE)
+dir.create(here("output_to_share_6hr/models"),      showWarnings = FALSE, recursive = TRUE)
+
+# Routing helpers
+out_fig  <- function(f) here("output_to_share_6hr/figures",     paste0(SITE_ID, "_", f))
+out_tbl  <- function(f) here("output_to_share_6hr/tables",      paste0(SITE_ID, "_", f))
+out_diag <- function(f) here("output_to_share_6hr/diagnostics", paste0(SITE_ID, "_", f))
+out_mod  <- function(f) here("output_to_share_6hr/models",      paste0(SITE_ID, "_", f))
+
+cat("Site:", SITE_ID, "\n")
+cat("Script version: v0.9_6hr\n")
+cat("Run started:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
+```
+
+---
+
+# Section 1 — Data Preparation
+
+## 1a. Load and Rename
+
+```{r load-data}
+df_raw <- read_parquet(data_path) %>%
+  rename(
+    hospital_id = site_id,
+    drug        = drug_received
+  ) %>%
+  mutate(drug = tolower(trimws(drug)))
+
+cat("Raw data loaded:\n")
+cat("  Rows:      ", nrow(df_raw), "\n")
+cat("  Hospitalizations:", n_distinct(df_raw$hospitalization_id), "\n")
+cat("  Hospitals: ", n_distinct(df_raw$hospital_id), "\n")
+cat("  Columns:   ", ncol(df_raw), "\n")
+cat("  Column names:", paste(names(df_raw), collapse = ", "), "\n\n")
+```
+
+## 1b. Raw Data Quality Scan
+
+```{r raw-qc}
+# 1b-i. Duplicate check
+dups_raw <- df_raw %>%
+  group_by(hospitalization_id) %>%
+  filter(n() > 1) %>%
+  ungroup()
+
+if (nrow(dups_raw) > 0) {
+  warning(n_distinct(dups_raw$hospitalization_id),
+          " duplicate hospitalization_ids in raw data.")
+  print(dups_raw %>% select(hospitalization_id, drug, induction_dose_mg))
+} else {
+  cat("Duplicate check: PASS\n\n")
+}
+
+# 1b-ii. Drug value check
+drug_counts_raw <- df_raw %>%
+  count(drug) %>%
+  mutate(pct = round(n / sum(n) * 100, 1))
+print(drug_counts_raw)
+
+unexpected_drug <- df_raw %>% filter(!drug %in% c("etomidate", "ketamine"))
+if (nrow(unexpected_drug) > 0) {
+  warning(nrow(unexpected_drug), " rows with unexpected drug values.")
+  print(count(unexpected_drug, drug))
+} else {
+  cat("Drug values check: PASS\n\n")
+}
+
+# 1b-iii. Missingness on source variables
+source_vars <- c(
+  "hospitalization_id", "hospital_id", "provider_id",
+  "drug", "induction_dose_mg", "dose_mg_kg", "weight_kg",
+  "age_years", "sex_category", "race_category", "ethnicity_category", "cci",
+  "worst_sbp_24hr_pre", "worst_hr_24hr_pre", "worst_spo2_24hr_pre",
+  "worst_sbp_6hr_pre",  "worst_hr_6hr_pre",  "worst_spo2_6hr_pre",
+  "any_vasopressor_24hrs_prior", "any_vasopressor_6hrs_prior",
+  "any_vasopressor_1hr_prior",
+  "ASE_7d_prior", "presumed_infection_7d_prior",
+  "location_at_intubation", "icu_type", "hospital_type",
+  "calendar_year", "calendar_quarter",
+  "weight_source", "weight_recorded_dttm", "weight_to_rsi_hours"
+)
+
+missingness_raw <- tibble(
+  variable    = source_vars,
+  n_total     = nrow(df_raw),
+  n_missing   = map_int(source_vars, ~ sum(is.na(df_raw[[.x]]))),
+  pct_missing = map_dbl(source_vars, ~ round(mean(is.na(df_raw[[.x]])) * 100, 1))
+) %>%
+  mutate(
+    site_id = SITE_ID,
+    flag    = case_when(
+      pct_missing == 0                     ~ "ok",
+      pct_missing > 0  & pct_missing <= 5  ~ "low_missing",
+      pct_missing > 5  & pct_missing <= 20 ~ "moderate_missing",
+      pct_missing > 20                     ~ "HIGH_MISSING"
+    )
+  )
+
+missingness_raw %>%
+  filter(pct_missing > 0) %>%
+  select(variable, n_missing, pct_missing, flag) %>%
+  knitr::kable(caption = "Variables with missing data (raw)")
+
+write_csv(missingness_raw, out_diag("01_missingness_raw.csv"))
+
+# 1b-iv. Impossible values
+impossible_checks <- list(
+  list(var = "induction_dose_mg",   lo = 2,    hi = 300,  label = "Dose (mg): 2-300",         drug_filter = NULL),
+  list(var = "dose_mg_kg",          lo = 0.05, hi = 0.75, label = "Dose mg/kg etomidate: 0.05-0.75", drug_filter = "etomidate"),
+  list(var = "dose_mg_kg",          lo = 0.10, hi = 6.00, label = "Dose mg/kg ketamine: 0.10-6.00",  drug_filter = "ketamine"),
+  list(var = "weight_kg",           lo = 20,   hi = 300,  label = "Weight (kg): 20-300",       drug_filter = NULL),
+  list(var = "age_years",           lo = 18,   hi = 120,  label = "Age (years): 18-120",       drug_filter = NULL),
+  list(var = "worst_sbp_24hr_pre",  lo = 20,   hi = 300,  label = "SBP 24hr (mmHg): 20-300",  drug_filter = NULL),
+  list(var = "worst_hr_24hr_pre",   lo = 20,   hi = 300,  label = "HR 24hr (bpm): 20-300",    drug_filter = NULL),
+  list(var = "worst_spo2_24hr_pre", lo = 50,   hi = 100,  label = "SpO2 24hr (%): 50-100",    drug_filter = NULL),
+  list(var = "worst_sbp_6hr_pre",   lo = 20,   hi = 300,  label = "SBP 6hr (mmHg): 20-300",   drug_filter = NULL),
+  list(var = "worst_hr_6hr_pre",    lo = 20,   hi = 300,  label = "HR 6hr (bpm): 20-300",     drug_filter = NULL),
+  list(var = "worst_spo2_6hr_pre",  lo = 50,   hi = 100,  label = "SpO2 6hr (%): 50-100",     drug_filter = NULL),
+  list(var = "cci",                 lo = 0,    hi = 50,   label = "CCI: 0-50",                drug_filter = NULL)
+)
+
+binary_checks <- c(
+  "any_vasopressor_24hrs_prior", "any_vasopressor_6hrs_prior",
+  "any_vasopressor_1hr_prior", "ASE_7d_prior", "presumed_infection_7d_prior"
+)
+
+impossible_results <- map_dfr(impossible_checks, function(chk) {
+  d <- if (!is.null(chk$drug_filter)) df_raw %>% filter(drug == chk$drug_filter) else df_raw
+  vals <- d[[chk$var]]
+  n_lo <- sum(vals < chk$lo, na.rm = TRUE)
+  n_hi <- sum(vals > chk$hi, na.rm = TRUE)
+  tibble(variable = chk$var, label = chk$label,
+         drug = if (!is.null(chk$drug_filter)) chk$drug_filter else "all",
+         min_obs = round(min(vals, na.rm = TRUE), 3),
+         max_obs = round(max(vals, na.rm = TRUE), 3),
+         n_below = n_lo, n_above = n_hi,
+         n_flagged = n_lo + n_hi,
+         flag = if_else(n_lo + n_hi > 0, "IMPOSSIBLE VALUE", "ok"))
+})
+
+binary_results <- map_dfr(binary_checks, function(v) {
+  vals <- df_raw[[v]]
+  n_invalid <- sum(!vals %in% c(0L, 1L, NA), na.rm = TRUE)
+  tibble(variable = v, label = paste0(v, ": expect 0/1"), drug = "all",
+         min_obs = min(vals, na.rm = TRUE), max_obs = max(vals, na.rm = TRUE),
+         n_below = NA_integer_, n_above = NA_integer_,
+         n_flagged = n_invalid,
+         flag = if_else(n_invalid > 0, "IMPOSSIBLE VALUE", "ok"))
+})
+
+impossible_all <- bind_rows(impossible_results, binary_results) %>%
+  mutate(site_id = SITE_ID)
+
+flagged_impossible <- impossible_all %>% filter(flag == "IMPOSSIBLE VALUE")
+if (nrow(flagged_impossible) == 0) {
+  cat("Impossible values check: PASS\n\n")
+} else {
+  warning(nrow(flagged_impossible), " variable(s) with impossible values.")
+  flagged_impossible %>%
+    select(variable, label, min_obs, max_obs, n_below, n_above, n_flagged) %>%
+    knitr::kable(caption = "Flagged impossible values")
+}
+write_csv(impossible_all, out_diag("01_impossible_values.csv"))
+
+# 1b-v/vi. Cross-tabs
+cat("Weight source by location:\n")
+df_raw %>%
+  tbl_cross(row = weight_source, col = location_at_intubation,
+            percent = "row", missing = "ifany") %>%
+  bold_labels()
+
+cat("ICU type by location:\n")
+df_raw %>%
+  tbl_cross(row = icu_type, col = location_at_intubation,
+            missing = "ifany") %>%
+  bold_labels()
+```
+
+## 1c. Cohort Construction
+
+```{r cohort-construction}
+df_clean <- df_raw
+
+waterfall <- tibble(step = character(), n = integer(), n_excluded = integer())
+
+log_step <- function(df, label, waterfall) {
+  prev_n <- if (nrow(waterfall) == 0) nrow(df_raw) else tail(waterfall$n, 1)
+  bind_rows(waterfall, tibble(step = label, n = nrow(df),
+                               n_excluded = prev_n - nrow(df)))
+}
+
+waterfall <- log_step(df_clean, "Raw data loaded", waterfall)
+
+df_clean <- df_clean %>% filter(induction_dose_mg >= 2 & induction_dose_mg <= 300)
+waterfall <- log_step(df_clean, "Exclude: impossible induction_dose_mg", waterfall)
+
+df_clean <- df_clean %>% filter(is.na(weight_kg) | (weight_kg >= 20 & weight_kg <= 300))
+waterfall <- log_step(df_clean, "Exclude: impossible weight_kg (where present)", waterfall)
+
+df_clean <- df_clean %>% filter(age_years >= 18 & age_years <= 120)
+waterfall <- log_step(df_clean, "Exclude: impossible age_years", waterfall)
+
+df_clean <- df_clean %>%
+  filter(
+    is.na(dose_mg_kg) |
+    (drug == "etomidate" & dose_mg_kg >= 0.05 & dose_mg_kg <= 0.75) |
+    (drug == "ketamine"  & dose_mg_kg >= 0.10 & dose_mg_kg <= 6.00)
+  )
+waterfall <- log_step(df_clean, "Exclude: impossible dose_mg_kg (drug-specific)", waterfall)
+
+waterfall <- waterfall %>% mutate(site_id = SITE_ID)
+
+waterfall %>% knitr::kable(caption = "Exclusion waterfall")
+write_csv(waterfall, out_diag("01_exclusion_waterfall.csv"))
+
+# Site structure
+n_hospitals    <- n_distinct(df_clean$hospital_id)
+hosp_counts    <- df_clean %>% count(hospital_id) %>%
+                    mutate(meets_re_threshold = n >= min_encounters_hospital)
+n_hospitals_re <- sum(hosp_counts$meets_re_threshold)
+single_hosp_site <- n_hospitals == 1
+
+prov_counts_wide <- df_clean %>%
+  mutate(weight_group = if_else(is.na(weight_kg), "Missing weight", "Weight present")) %>%
+  count(provider_id, weight_group) %>%
+  pivot_wider(names_from = weight_group, values_from = n, values_fill = 0) %>%
+  mutate(
+    n_total            = `Weight present` + `Missing weight`,
+    pct_missing        = round(`Missing weight` / n_total * 100, 1),
+    meets_re_threshold = `Weight present` >= min_encounters_provider
+  ) %>%
+  arrange(desc(n_total)) %>%
+  mutate(provider_rank = row_number())
+
+n_providers    <- nrow(prov_counts_wide)
+n_providers_re <- sum(prov_counts_wide$meets_re_threshold)
+
+cat(sprintf("Post-exclusion cohort (weight-missing retained):\n"))
+cat(sprintf("  N encounters:  %d\n", nrow(df_clean)))
+cat(sprintf("  With weight:   %d\n", sum(!is.na(df_clean$weight_kg))))
+cat(sprintf("  Missing wt:    %d\n", sum(is.na(df_clean$weight_kg))))
+cat(sprintf("  Hospitals:     %d total | %d meet RE threshold\n", n_hospitals, n_hospitals_re))
+cat(sprintf("  Providers:     %d total | %d meet RE threshold\n", n_providers, n_providers_re))
+
+# Provider encounter plot
+p_provider_dist <- prov_counts_wide %>%
+  pivot_longer(cols = c("Weight present", "Missing weight"),
+               names_to = "weight_group", values_to = "n") %>%
+  mutate(weight_group = factor(weight_group, levels = c("Weight present","Missing weight"))) %>%
+  ggplot(aes(x = provider_rank, y = n, fill = weight_group)) +
+  geom_col(width = 0.8, colour = "white", linewidth = 0.2) +
+  geom_hline(yintercept = min_encounters_provider,
+             linetype = "dashed", colour = "black", linewidth = 0.7) +
+  scale_fill_manual(values = c("Weight present" = "#2E75B6",
+                               "Missing weight"  = "#E67E22"), name = NULL) +
+  scale_x_continuous(breaks = NULL) +
+  labs(title = paste0("Provider encounter volume — ", SITE_ID),
+       subtitle = paste0(n_providers, " providers | ",
+                         n_providers_re, " meet RE threshold | sorted by total encounters"),
+       x = "Providers (ranked by total encounters, identities suppressed)",
+       y = "Encounters",
+       caption = "Blue = weight present | Orange = missing weight | Dashed = RE threshold") +
+  theme_bw(base_size = 12) + theme(legend.position = "bottom")
+
+ggsave(out_diag("01_provider_encounter_dist.png"),
+       plot = p_provider_dist, width = 10, height = 5, dpi = 150)
+p_provider_dist
+
+provider_enc_summary <- bind_rows(
+  prov_counts_wide %>% filter(meets_re_threshold) %>%
+    summarise(group = paste0(">= ", min_encounters_provider, " wp encounters (meets RE)"),
+              n_providers = n(), pct_providers = round(n()/nrow(prov_counts_wide)*100,1),
+              n_enc_weight_pres = sum(`Weight present`), n_enc_missing_wt = sum(`Missing weight`),
+              n_enc_total = sum(n_total), pct_missing = round(sum(`Missing weight`)/sum(n_total)*100,1),
+              enc_wp_median = median(`Weight present`), enc_wp_p25 = quantile(`Weight present`,0.25),
+              enc_wp_p75 = quantile(`Weight present`,0.75), enc_wp_max = max(`Weight present`)),
+  prov_counts_wide %>% filter(!meets_re_threshold) %>%
+    summarise(group = paste0("< ", min_encounters_provider, " wp encounters (below RE)"),
+              n_providers = n(), pct_providers = round(n()/nrow(prov_counts_wide)*100,1),
+              n_enc_weight_pres = sum(`Weight present`), n_enc_missing_wt = sum(`Missing weight`),
+              n_enc_total = sum(n_total), pct_missing = round(sum(`Missing weight`)/sum(n_total)*100,1),
+              enc_wp_median = median(`Weight present`), enc_wp_p25 = quantile(`Weight present`,0.25),
+              enc_wp_p75 = quantile(`Weight present`,0.75), enc_wp_max = max(`Weight present`)),
+  prov_counts_wide %>%
+    summarise(group = "All providers",
+              n_providers = n(), pct_providers = 100.0,
+              n_enc_weight_pres = sum(`Weight present`), n_enc_missing_wt = sum(`Missing weight`),
+              n_enc_total = sum(n_total), pct_missing = round(sum(`Missing weight`)/sum(n_total)*100,1),
+              enc_wp_median = median(`Weight present`), enc_wp_p25 = quantile(`Weight present`,0.25),
+              enc_wp_p75 = quantile(`Weight present`,0.75), enc_wp_max = max(`Weight present`))
+) %>% mutate(site_id = SITE_ID)
+
+provider_enc_summary %>% knitr::kable(caption = "Provider encounter summary by RE threshold")
+write_csv(provider_enc_summary, out_diag("01_provider_encounter_table.csv"))
+
+# Store QC scalars for cohort summary
+n_impossible_flags_1c <- nrow(flagged_impossible)
+n_high_miss_raw_1c    <- sum(missingness_raw$flag == "HIGH_MISSING")
+```
+
+---
+
+# Section 2 — Derived Variables and Analytic Dataset
+
+## 2a. Structural Derivations
+
+```{r structural-derivations}
+tier_levels <- c("reduced","intermediate_reduced","intermediate_full","full")
+tier_labels <- c("Reduced","Intermediate-Reduced","Intermediate-Full","Full")
+tier_colours <- c(
+  "reduced"              = "#27AE60",
+  "intermediate_reduced" = "#F1C40F",
+  "intermediate_full"    = "#E67E22",
+  "full"                 = "#C0392B"
+)
+
+df_clean <- df_clean %>%
+  mutate(
+    race_eth = case_when(
+      tolower(ethnicity_category) == "hispanic"                              ~ "Hispanic",
+      tolower(race_category) == "white"                                      ~ "NH White",
+      tolower(race_category) %in% c("black","black or african american")     ~ "NH Black/African American",
+      tolower(race_category) == "asian"                                      ~ "NH Asian",
+      TRUE                                                                   ~ "NH Other/Unknown"
+    ),
+    location_group = case_when(
+      tolower(location_at_intubation) == "ed"                                         ~ "ED",
+      tolower(icu_type) %in% c("medical_icu","medical","mixed_icu","mixed","general_icu") ~ "Medical/Mixed ICU",
+      tolower(icu_type) %in% c("surgical_icu","surgical")                             ~ "Surgical ICU",
+      tolower(icu_type) %in% c("cardiac_icu","cardiac","cardiovascular")              ~ "Cardiac ICU",
+      tolower(icu_type) %in% c("neuro_icu","neuro","neurological","neurosurgical")    ~ "Neuro ICU",
+      TRUE                                                                             ~ "Other/Unknown"
+    ),
+    icu_type = if_else(tolower(location_at_intubation) == "ed",
+                       "Not applicable (ED)", icu_type),
+    weight_window = case_when(
+      weight_source == "previous_hospitalization_weight_28days" &
+        weight_to_rsi_hours <= 168  ~ "7 days",
+      weight_source == "previous_hospitalization_weight_28days" &
+        weight_to_rsi_hours <= 336  ~ "14 days",
+      weight_source == "previous_hospitalization_weight_28days" &
+        weight_to_rsi_hours <= 672  ~ "28 days",
+      TRUE ~ NA_character_
+    ),
+    drug_ketamine = as.integer(drug == "ketamine")
+  )
+
+min_cell_location <- 10
+df_clean <- df_clean %>%
+  group_by(location_group) %>%
+  mutate(location_n = n()) %>%
+  ungroup() %>%
+  mutate(location_group = if_else(
+    location_n < min_cell_location & location_group != "Other/Unknown",
+    "Other/Unknown", location_group)) %>%
+  select(-location_n)
+
+other_n <- sum(df_clean$location_group == "Other/Unknown", na.rm = TRUE)
+if (other_n > 0 && other_n < min_cell_location) {
+  largest_cat <- df_clean %>% filter(location_group != "Other/Unknown") %>%
+    count(location_group) %>% slice_max(n, n = 1) %>% pull(location_group)
+  df_clean <- df_clean %>%
+    mutate(location_group = if_else(location_group == "Other/Unknown",
+                                    largest_cat, location_group))
+  cat(sprintf("  location_group 'Other/Unknown' absorbed into '%s'\n", largest_cat))
+}
+
+df_clean <- df_clean %>%
+  mutate(
+    race_eth       = relevel(factor(race_eth),       ref = "NH White"),
+    location_group = relevel(factor(location_group), ref = "Medical/Mixed ICU")
+  )
+
+year_min <- min(df_clean$calendar_year, na.rm = TRUE)
+df_clean <- df_clean %>% mutate(calendar_year_c = calendar_year - year_min)
+
+cat("Location group distribution:\n")
+print(count(df_clean, location_group))
+cat("\nRace/ethnicity distribution:\n")
+print(count(df_clean, race_eth))
+```
+
+## 2b. Dose Derivations
+
+```{r dose-derivations}
+df_clean <- df_clean %>%
+  mutate(
+    dose_reduced = case_when(
+      drug == "etomidate" & dose_mg_kg <  0.25 ~ 1L,
+      drug == "etomidate" & dose_mg_kg >= 0.25 ~ 0L,
+      drug == "ketamine"  & dose_mg_kg <  1.5  ~ 1L,
+      drug == "ketamine"  & dose_mg_kg >= 1.5  ~ 0L
+    ),
+    dose_ref = case_when(drug == "etomidate" ~ 0.30, drug == "ketamine" ~ 2.00),
+    pct_below_ref  = (dose_ref - dose_mg_kg) / dose_ref,
+    dose_low_25pct = as.integer(pct_below_ref > 0.25),
+    dose_tier = case_when(
+      drug == "etomidate" & dose_mg_kg <  0.20                      ~ "reduced",
+      drug == "etomidate" & dose_mg_kg >= 0.20 & dose_mg_kg <  0.25 ~ "intermediate_reduced",
+      drug == "etomidate" & dose_mg_kg >= 0.25 & dose_mg_kg <  0.30 ~ "intermediate_full",
+      drug == "etomidate" & dose_mg_kg >= 0.30                      ~ "full",
+      drug == "ketamine"  & dose_mg_kg <  1.00                      ~ "reduced",
+      drug == "ketamine"  & dose_mg_kg >= 1.00 & dose_mg_kg <  1.50 ~ "intermediate_reduced",
+      drug == "ketamine"  & dose_mg_kg >= 1.50 & dose_mg_kg <  2.00 ~ "intermediate_full",
+      drug == "ketamine"  & dose_mg_kg >= 2.00                      ~ "full"
+    )
+  )
+
+cat(sprintf("dose_reduced: %d reduced (%.1f%%), %d standard/full\n",
+            sum(df_clean$dose_reduced == 1, na.rm = TRUE),
+            mean(df_clean$dose_reduced == 1, na.rm = TRUE) * 100,
+            sum(df_clean$dose_reduced == 0, na.rm = TRUE)))
+```
+
+## 2c. Post-Derivation Consistency Checks
+
+```{r derivation-checks}
+derived_checks <- list()
+
+check1 <- df_clean %>%
+  filter(!is.na(dose_mg_kg)) %>%
+  mutate(tier_below_thresh = dose_tier %in% c("reduced","intermediate_reduced")) %>%
+  group_by(drug) %>%
+  summarise(
+    n_tier_below_thresh = sum(tier_below_thresh, na.rm = TRUE),
+    n_dose_reduced_1    = sum(dose_reduced == 1, na.rm = TRUE),
+    n_mismatch          = sum(tier_below_thresh != (dose_reduced == 1), na.rm = TRUE),
+    check               = if_else(sum(tier_below_thresh != (dose_reduced == 1),
+                                      na.rm = TRUE) == 0, "PASS", "MISMATCH"),
+    .groups = "drop"
+  ) %>% mutate(check_name = "dose_tier below threshold == dose_reduced 1")
+
+check2 <- df_clean %>%
+  mutate(loc_ed_group = location_group == "ED",
+         loc_ed_raw   = tolower(location_at_intubation) == "ed") %>%
+  summarise(n_ed_group = sum(loc_ed_group, na.rm = TRUE),
+            n_ed_raw   = sum(loc_ed_raw,   na.rm = TRUE),
+            n_mismatch = sum(loc_ed_group != loc_ed_raw, na.rm = TRUE),
+            check = if_else(sum(loc_ed_group != loc_ed_raw, na.rm = TRUE) == 0,
+                            "PASS", "MISMATCH")) %>%
+  mutate(check_name = "ED location_group vs location_at_intubation")
+
+check3 <- df_clean %>%
+  filter(tolower(ethnicity_category) == "hispanic") %>%
+  summarise(n_hispanic_eth  = n(),
+            n_race_eth_hisp = sum(race_eth == "Hispanic", na.rm = TRUE),
+            n_mismatch      = sum(race_eth != "Hispanic", na.rm = TRUE),
+            check = if_else(sum(race_eth != "Hispanic", na.rm = TRUE) == 0,
+                            "PASS", "MISMATCH")) %>%
+  mutate(check_name = "Hispanic ethnicity -> Hispanic race_eth")
+
+check4 <- df_clean %>%
+  filter(!is.na(weight_kg) & !is.na(induction_dose_mg) & !is.na(dose_mg_kg)) %>%
+  mutate(dose_mgkg_recomputed = induction_dose_mg / weight_kg,
+         discrepancy = abs(dose_mg_kg - dose_mgkg_recomputed)) %>%
+  summarise(n_checked = n(), n_discrepant = sum(discrepancy > 0.01, na.rm = TRUE),
+            max_discrepancy = round(max(discrepancy, na.rm = TRUE), 4),
+            check = if_else(sum(discrepancy > 0.01, na.rm = TRUE) == 0,
+                            "PASS", "DISCREPANCY")) %>%
+  mutate(check_name = "dose_mg_kg vs induction_dose_mg/weight_kg (tol=0.01)")
+
+check5 <- df_clean %>%
+  summarise(n_missing_weight = sum(is.na(weight_kg)),
+            n_dose_tier_na   = sum(is.na(dose_tier)),
+            n_unexpected_na  = sum(is.na(dose_tier) & !is.na(weight_kg)),
+            check = if_else(sum(is.na(dose_tier) & !is.na(weight_kg)) == 0,
+                            "PASS — dose NAs match missing weight",
+                            "UNEXPECTED NAs")) %>%
+  mutate(check_name = "dose variable NAs match missing weight")
+
+bind_rows(check1, check2, check3, check4, check5) %>%
+  mutate(site_id = SITE_ID) %>%
+  { write_csv(., out_diag("02_derived_variable_checks.csv")); . } %>%
+  select(check_name, check) %>%
+  knitr::kable(caption = "Post-derivation consistency checks")
+```
+
+## 2d–2e. Missingness and MICE Imputation
+
+```{r missingness-mice}
+analytic_vars <- c(
+  "hospitalization_id","hospital_id","provider_id",
+  "induction_dose_mg","dose_mg_kg","dose_reduced","dose_low_25pct","dose_tier",
+  "age_years","sex_category","race_eth","cci",
+  "worst_sbp_6hr_pre","worst_hr_6hr_pre","worst_spo2_6hr_pre",
+  "worst_sbp_24hr_pre","worst_hr_24hr_pre","worst_spo2_24hr_pre",
+  "any_vasopressor_6hrs_prior","any_vasopressor_24hrs_prior","any_vasopressor_1hr_prior",
+  "ASE_7d_prior","presumed_infection_7d_prior",
+  "location_group","location_at_intubation","icu_type",
+  "hospital_type","calendar_year","calendar_year_c",
+  "weight_kg","weight_source","weight_window","drug","drug_ketamine"
+)
+
+missingness_analytic <- tibble(
+  variable    = analytic_vars,
+  n_total     = nrow(df_clean),
+  n_missing   = map_int(analytic_vars, ~ sum(is.na(df_clean[[.x]]))),
+  pct_missing = map_dbl(analytic_vars, ~ round(mean(is.na(df_clean[[.x]])) * 100, 1))
+) %>%
+  mutate(
+    site_id = SITE_ID,
+    expected_na_for_nomw = variable %in% c("dose_mg_kg","dose_reduced","dose_low_25pct",
+                                            "dose_tier","weight_kg","weight_source",
+                                            "weight_window","pct_below_ref",
+                                            "worst_sbp_6hr_pre","worst_hr_6hr_pre",
+                                            "worst_spo2_6hr_pre","any_vasopressor_6hrs_prior"),
+    flag = case_when(
+      expected_na_for_nomw                  ~ "expected_if_missing_weight",
+      pct_missing == 0                      ~ "ok",
+      pct_missing > 0  & pct_missing <= 5   ~ "low_missing",
+      pct_missing > 5  & pct_missing <= 20  ~ "moderate_missing",
+      pct_missing > 20                      ~ "HIGH_MISSING"
+    )
+  )
+
+missingness_analytic %>%
+  filter(pct_missing > 0) %>%
+  select(variable, n_missing, pct_missing, flag) %>%
+  knitr::kable(caption = "Post-derivation missingness")
+write_csv(missingness_analytic, out_diag("02_missingness_analytic.csv"))
+
+# MICE — 6hr vitals only
+vitals_miss <- df_clean %>%
+  summarise(across(c(worst_sbp_6hr_pre, worst_hr_6hr_pre, worst_spo2_6hr_pre),
+                   ~ mean(is.na(.)) * 100)) %>% unlist()
+
+cat(sprintf("Pre-imputation missingness (6hr) — SBP: %.1f%%  HR: %.1f%%  SpO2: %.1f%%\n",
+            vitals_miss["worst_sbp_6hr_pre"],
+            vitals_miss["worst_hr_6hr_pre"],
+            vitals_miss["worst_spo2_6hr_pre"]))
+
+if (all(vitals_miss < 1)) {
+  cat("All 6hr vitals <1% missing — complete-case.\n")
+  imputation_method <- "complete_case_6hr"
+} else {
+  impute_vars <- c("worst_sbp_6hr_pre","worst_hr_6hr_pre","worst_spo2_6hr_pre",
+                   "age_years","cci","sex_category","race_eth",
+                   "any_vasopressor_6hrs_prior","ASE_7d_prior","presumed_infection_7d_prior",
+                   "location_group","hospital_type","calendar_year","drug")
+  df_for_mice <- df_clean %>% select(hospitalization_id, all_of(impute_vars))
+  mice_out <- tryCatch(
+    mice(df_for_mice %>% select(-hospitalization_id),
+         m = 5, maxit = 10, method = "pmm", printFlag = FALSE, seed = 20260319),
+    error = function(e) { cat("MICE failed:", conditionMessage(e), "\n"); NULL }
+  )
+  if (!is.null(mice_out)) {
+    df_imp1 <- complete(mice_out, action = 1) %>%
+      mutate(hospitalization_id = df_for_mice$hospitalization_id)
+    df_clean <- df_clean %>%
+      select(-worst_sbp_6hr_pre, -worst_hr_6hr_pre, -worst_spo2_6hr_pre) %>%
+      left_join(df_imp1 %>% select(hospitalization_id,
+                                    worst_sbp_6hr_pre, worst_hr_6hr_pre, worst_spo2_6hr_pre),
+                by = "hospitalization_id")
+    assign("mice_out_global", mice_out, envir = .GlobalEnv)
+    imputation_method <- "MICE_pmm_m5_vitals_6hr_only"
+    cat("MICE complete.\n")
+  } else {
+    imputation_method <- "complete_case_fallback_6hr"
+  }
+}
+
+df_clean <- df_clean %>%
+  mutate(age_s  = scale(age_years)[,1], cci_s = scale(cci)[,1],
+         sbp_s  = scale(worst_sbp_6hr_pre)[,1],
+         hr_s   = scale(worst_hr_6hr_pre)[,1],
+         spo2_s = scale(worst_spo2_6hr_pre)[,1])
+
+cat(sprintf("Imputation method: %s\n", imputation_method))
+```
+
+## 2f. Analytic Dataset Split
+
+```{r analytic-split}
+df <- df_clean %>% filter(!is.na(weight_kg))
+df_no_weight <- df_clean %>% filter(is.na(weight_kg))
+
+# Recompute provider/hospital counts on analytic cohort
+n_hospitals      <- n_distinct(df$hospital_id)
+hosp_counts_df   <- df %>% count(hospital_id) %>%
+                      mutate(meets_re_threshold = n >= min_encounters_hospital)
+prov_counts_df   <- df %>% count(provider_id) %>%
+                      mutate(meets_re_threshold = n >= min_encounters_provider)
+n_hospitals_re   <- sum(hosp_counts_df$meets_re_threshold)
+n_providers_re   <- sum(prov_counts_df$meets_re_threshold)
+single_hosp_site <- n_hospitals == 1
+
+# Anonymize provider_id
+provider_id_map <- df %>% distinct(provider_id) %>% arrange(provider_id) %>%
+  mutate(provider_id_anon = row_number())
+df <- df %>% left_join(provider_id_map, by = "provider_id") %>%
+  select(-provider_id) %>% rename(provider_id = provider_id_anon)
+df_no_weight <- df_no_weight %>% left_join(provider_id_map, by = "provider_id") %>%
+  select(-provider_id) %>% rename(provider_id = provider_id_anon)
+
+df_etomidate <- df %>% filter(drug == "etomidate")
+df_ketamine  <- df %>% filter(drug == "ketamine")
+
+cat(sprintf("Primary analytic cohort (df): %d encounters\n", nrow(df)))
+cat(sprintf("  Etomidate: %d | Ketamine: %d\n",
+            nrow(df_etomidate), nrow(df_ketamine)))
+cat(sprintf("Missing weight (df_no_weight): %d\n\n", nrow(df_no_weight)))
+
+# Missing weight comparison
+missing_wt_comparison <- bind_rows(
+  df_no_weight %>%
+    summarise(group = "Missing weight (excluded)",
+              n = n(), age_median = median(age_years, na.rm=TRUE),
+              pct_male = mean(tolower(sex_category)=="male", na.rm=TRUE)*100,
+              pct_vaso_6hr = mean(any_vasopressor_6hrs_prior==1, na.rm=TRUE)*100,
+              pct_ase = mean(ASE_7d_prior==1, na.rm=TRUE)*100,
+              pct_ed  = mean(location_group=="ED", na.rm=TRUE)*100,
+              pct_etomidate = mean(drug=="etomidate", na.rm=TRUE)*100),
+  df %>%
+    summarise(group = "Analytic cohort (weight present)",
+              n = n(), age_median = median(age_years, na.rm=TRUE),
+              pct_male = mean(tolower(sex_category)=="male", na.rm=TRUE)*100,
+              pct_vaso_6hr = mean(any_vasopressor_6hrs_prior==1, na.rm=TRUE)*100,
+              pct_ase = mean(ASE_7d_prior==1, na.rm=TRUE)*100,
+              pct_ed  = mean(location_group=="ED", na.rm=TRUE)*100,
+              pct_etomidate = mean(drug=="etomidate", na.rm=TRUE)*100)
+) %>% mutate(site_id = SITE_ID)
+
+missing_wt_comparison %>%
+  knitr::kable(caption = "Missing weight comparison: excluded vs. analytic cohort")
+write_csv(missing_wt_comparison, out_diag("01_missing_weight.csv"))
+
+# Cohort summary
+cohort_summary <- tibble(
+  site_id = SITE_ID,
+  n_raw = nrow(df_raw), n_after_exclusions = nrow(df_clean),
+  n_with_weight = sum(!is.na(df_clean$weight_kg)),
+  n_excluded_missing_weight = nrow(df_no_weight),
+  n_impossible_flags = n_impossible_flags_1c, n_high_miss_raw = n_high_miss_raw_1c,
+  n_primary_analytic = nrow(df), n_etomidate = nrow(df_etomidate),
+  n_ketamine = nrow(df_ketamine), n_hospitals = n_hospitals,
+  n_hospitals_re = n_hospitals_re, n_providers = n_distinct(df$provider_id),
+  n_providers_re = n_providers_re, single_hosp_site = single_hosp_site,
+  imputation_method = imputation_method, year_min = year_min,
+  year_max = max(df$calendar_year, na.rm=TRUE),
+  run_datetime = format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+)
+write_csv(cohort_summary, out_diag("02_cohort_summary.csv"))
+cohort_summary %>% knitr::kable(caption = "Combined cohort summary")
+
+cat("Sections 1-2 complete. Analytic datasets ready.\n")
+```
+
+---
+
+# Section 3 — Descriptive Outputs
+
+## 3a. Table 1
+
+```{r table1}
+drug_labels  <- c(etomidate = "Etomidate", ketamine = "Ketamine")
+drug_colours <- c(etomidate = "#2E75B6",   ketamine = "#E67E22")
+
+tbl1_df <- df %>%
+  group_by(drug) %>%
+  summarise(
+    n                  = n(),
+    age_median         = median(age_years, na.rm=TRUE),
+    age_q1             = quantile(age_years, 0.25, na.rm=TRUE),
+    age_q3             = quantile(age_years, 0.75, na.rm=TRUE),
+    pct_male           = mean(tolower(sex_category)=="male", na.rm=TRUE)*100,
+    pct_white          = mean(race_eth=="NH White", na.rm=TRUE)*100,
+    pct_black          = mean(race_eth=="NH Black/African American", na.rm=TRUE)*100,
+    pct_hispanic       = mean(race_eth=="Hispanic", na.rm=TRUE)*100,
+    pct_asian          = mean(race_eth=="NH Asian", na.rm=TRUE)*100,
+    pct_other_unk      = mean(race_eth=="NH Other/Unknown", na.rm=TRUE)*100,
+    cci_median         = median(cci, na.rm=TRUE),
+    cci_q1             = quantile(cci, 0.25, na.rm=TRUE),
+    cci_q3             = quantile(cci, 0.75, na.rm=TRUE),
+    sbp_24hr_median    = median(worst_sbp_24hr_pre, na.rm=TRUE),
+    sbp_24hr_q1        = quantile(worst_sbp_24hr_pre, 0.25, na.rm=TRUE),
+    sbp_24hr_q3        = quantile(worst_sbp_24hr_pre, 0.75, na.rm=TRUE),
+    hr_24hr_median     = median(worst_hr_24hr_pre, na.rm=TRUE),
+    hr_24hr_q1         = quantile(worst_hr_24hr_pre, 0.25, na.rm=TRUE),
+    hr_24hr_q3         = quantile(worst_hr_24hr_pre, 0.75, na.rm=TRUE),
+    spo2_24hr_median   = median(worst_spo2_24hr_pre, na.rm=TRUE),
+    spo2_24hr_q1       = quantile(worst_spo2_24hr_pre, 0.25, na.rm=TRUE),
+    spo2_24hr_q3       = quantile(worst_spo2_24hr_pre, 0.75, na.rm=TRUE),
+    sbp_6hr_median     = median(worst_sbp_6hr_pre, na.rm=TRUE),
+    sbp_6hr_q1         = quantile(worst_sbp_6hr_pre, 0.25, na.rm=TRUE),
+    sbp_6hr_q3         = quantile(worst_sbp_6hr_pre, 0.75, na.rm=TRUE),
+    hr_6hr_median      = median(worst_hr_6hr_pre, na.rm=TRUE),
+    hr_6hr_q1          = quantile(worst_hr_6hr_pre, 0.25, na.rm=TRUE),
+    hr_6hr_q3          = quantile(worst_hr_6hr_pre, 0.75, na.rm=TRUE),
+    spo2_6hr_median    = median(worst_spo2_6hr_pre, na.rm=TRUE),
+    spo2_6hr_q1        = quantile(worst_spo2_6hr_pre, 0.25, na.rm=TRUE),
+    spo2_6hr_q3        = quantile(worst_spo2_6hr_pre, 0.75, na.rm=TRUE),
+    pct_vaso_24hr      = mean(any_vasopressor_24hrs_prior==1, na.rm=TRUE)*100,
+    pct_vaso_6hr       = mean(any_vasopressor_6hrs_prior==1,  na.rm=TRUE)*100,
+    pct_vaso_1hr       = mean(any_vasopressor_1hr_prior==1,   na.rm=TRUE)*100,
+    pct_presumed_infx  = mean(presumed_infection_7d_prior==1, na.rm=TRUE)*100,
+    pct_ase            = mean(ASE_7d_prior==1, na.rm=TRUE)*100,
+    dose_mg_median     = median(induction_dose_mg, na.rm=TRUE),
+    dose_mg_q1         = quantile(induction_dose_mg, 0.25, na.rm=TRUE),
+    dose_mg_q3         = quantile(induction_dose_mg, 0.75, na.rm=TRUE),
+    dose_mgkg_median   = median(dose_mg_kg, na.rm=TRUE),
+    dose_mgkg_q1       = quantile(dose_mg_kg, 0.25, na.rm=TRUE),
+    dose_mgkg_q3       = quantile(dose_mg_kg, 0.75, na.rm=TRUE),
+    pct_dose_reduced   = mean(dose_reduced==1, na.rm=TRUE)*100,
+    pct_dose_low25     = mean(dose_low_25pct==1, na.rm=TRUE)*100,
+    pct_tier_reduced        = mean(dose_tier=="reduced",              na.rm=TRUE)*100,
+    pct_tier_int_reduced    = mean(dose_tier=="intermediate_reduced", na.rm=TRUE)*100,
+    pct_tier_int_full       = mean(dose_tier=="intermediate_full",    na.rm=TRUE)*100,
+    pct_tier_full           = mean(dose_tier=="full",                 na.rm=TRUE)*100,
+    pct_ed             = mean(location_group=="ED", na.rm=TRUE)*100,
+    .groups = "drop"
+  ) %>% mutate(site_id = SITE_ID) %>%
+  pivot_longer(cols = -c(drug, site_id), names_to = "statistic", values_to = "value") %>%
+  pivot_wider(names_from = drug, values_from = value)
+
+write_csv(tbl1_df, out_tbl("table1_by_drug.csv"))
+
+# Table 1 missingness
+tbl1_miss_vars <- c(
+  "age_years","sex_category","race_category","ethnicity_category","cci",
+  "worst_sbp_24hr_pre","worst_hr_24hr_pre","worst_spo2_24hr_pre",
+  "worst_sbp_6hr_pre","worst_hr_6hr_pre","worst_spo2_6hr_pre",
+  "any_vasopressor_24hrs_prior","any_vasopressor_6hrs_prior","any_vasopressor_1hr_prior",
+  "presumed_infection_7d_prior","ASE_7d_prior",
+  "induction_dose_mg","dose_mg_kg","dose_tier","location_group"
+)
+tbl1_missingness <- df %>%
+  group_by(drug) %>%
+  summarise(across(all_of(tbl1_miss_vars),
+                   list(n_miss  = ~ sum(is.na(.)),
+                        pct_miss = ~ round(mean(is.na(.))*100, 1))),
+            .groups = "drop") %>%
+  mutate(site_id = SITE_ID) %>%
+  pivot_longer(cols = -c(drug, site_id), names_to = "statistic", values_to = "value") %>%
+  pivot_wider(names_from = drug, values_from = value)
+
+tbl1_icu <- df %>%
+  count(drug, icu_type) %>%
+  group_by(drug) %>% mutate(pct = round(n/sum(n)*100,1)) %>%
+  ungroup() %>% mutate(site_id = SITE_ID)
+
+write_csv(tbl1_missingness, out_tbl("table1_missingness.csv"))
+write_csv(tbl1_icu,         out_tbl("table1_icu_type.csv"))
+cat("Table 1 exported (main + missingness + ICU type).\n")
+```
+
+## 3b. Dose Distributions and Site Summary Figures
+
+```{r dose-distributions}
+# Percentiles — overall + by location
+dose_dist <- bind_rows(
+  df %>% group_by(drug) %>%
+    reframe(location_group = "All", percentile = seq(1,99),
+            dose_mgkg_pctile = quantile(dose_mg_kg, probs=seq(0.01,0.99,0.01), na.rm=TRUE)),
+  df %>% group_by(drug, location_group = as.character(location_group)) %>%
+    reframe(percentile = seq(1,99),
+            dose_mgkg_pctile = quantile(dose_mg_kg, probs=seq(0.01,0.99,0.01), na.rm=TRUE))
+) %>% mutate(site_id = SITE_ID)
+write_csv(dose_dist, out_fig("dose_distribution_percentiles.csv"))
+
+# Deciles
+dose_deciles <- bind_rows(
+  df %>% group_by(drug) %>%
+    reframe(location_group = "All", decile = seq(10,90,10),
+            dose_mgkg_decile = quantile(dose_mg_kg, probs=seq(0.10,0.90,0.10), na.rm=TRUE)),
+  df %>% group_by(drug, location_group = as.character(location_group)) %>%
+    reframe(decile = seq(10,90,10),
+            dose_mgkg_decile = quantile(dose_mg_kg, probs=seq(0.10,0.90,0.10), na.rm=TRUE))
+) %>% mutate(site_id = SITE_ID)
+write_csv(dose_deciles, out_fig("dose_decile_percentiles.csv"))
+
+# Categorical bins
+etom_breaks <- c(0,0.05,0.10,0.15,0.20,0.25,0.30,0.35,0.45,0.60,Inf)
+etom_labels <- c("<0.05","0.05-0.09","0.10-0.14","0.15-0.19","0.20-0.24",
+                 "0.25-0.29","0.30-0.34","0.35-0.44","0.45-0.60",">0.60")
+keta_breaks <- c(0,0.30,0.50,0.70,0.90,1.10,1.30,1.50,1.70,1.90,Inf)
+keta_labels <- c("<0.30","0.30-0.49","0.50-0.69","0.70-0.89","0.90-1.09",
+                 "1.10-1.29","1.30-1.49","1.50-1.69","1.70-1.89","\u22651.90")
+
+bind_rows(
+  df_etomidate %>% filter(!is.na(dose_mg_kg)) %>%
+    mutate(dose_category = cut(dose_mg_kg, breaks=etom_breaks, labels=etom_labels, right=FALSE)) %>%
+    count(drug, dose_category, .drop=FALSE) %>%
+    group_by(drug) %>% mutate(pct = round(n/sum(n)*100,1)) %>% ungroup(),
+  df_ketamine %>% filter(!is.na(dose_mg_kg)) %>%
+    mutate(dose_category = cut(dose_mg_kg, breaks=keta_breaks, labels=keta_labels, right=FALSE)) %>%
+    count(drug, dose_category, .drop=FALSE) %>%
+    group_by(drug) %>% mutate(pct = round(n/sum(n)*100,1)) %>% ungroup()
+) %>% mutate(site_id = SITE_ID) %>%
+  write_csv(out_tbl("dose_categorical_counts.csv"))
+
+cat("Dose distribution files exported.\n")
+
+# Site caption for figures
+n_etom <- nrow(df_etomidate); n_keta <- nrow(df_ketamine)
+yr_min <- min(df$calendar_year, na.rm=TRUE); yr_max <- max(df$calendar_year, na.rm=TRUE)
+site_caption <- paste0(SITE_ID, "  |  ", n_etom+n_keta, " encounters (",
+                       n_etom, " etomidate, ", n_keta, " ketamine)  |  ",
+                       yr_min, "\u2013", yr_max,
+                       "  |  Induction Dose Variability Study \u2014 CLIF Consortium")
+
+theme_pilot <- function() {
+  theme_bw(base_size=13) +
+    theme(plot.title=element_text(face="bold",size=14,colour="#1F3864"),
+          plot.subtitle=element_text(size=11,colour="#444444"),
+          plot.caption=element_text(size=9,colour="#888888",hjust=0),
+          strip.background=element_rect(fill="#D5E8F0"),
+          strip.text=element_text(face="bold",size=11,colour="#1F3864"),
+          panel.grid.minor=element_blank(), legend.position="bottom",
+          plot.margin=margin(12,16,12,12))
+}
+
+# Figure: Dose histogram
+ref_lines <- tibble(
+  drug=c("etomidate","etomidate","etomidate","ketamine","ketamine","ketamine"),
+  xint=c(0.20,0.30,0.28,1.00,2.00,1.60),
+  linetype=c("dashed","solid","dotted","dashed","solid","dotted"),
+  colour=c("#C0392B","#1F3864","#7F7F7F","#C0392B","#1F3864","#7F7F7F")
+)
+dose_plot_data <- bind_rows(
+  df_etomidate %>% select(dose_mg_kg) %>% mutate(drug="etomidate"),
+  df_ketamine  %>% select(dose_mg_kg) %>% mutate(drug="ketamine")
+) %>% mutate(drug_label=factor(recode(drug,!!!drug_labels),levels=c("Etomidate","Ketamine")))
+dose_medians <- dose_plot_data %>% group_by(drug,drug_label) %>%
+  summarise(med=median(dose_mg_kg,na.rm=TRUE),.groups="drop")
+
+p_hist <- ggplot(dose_plot_data, aes(x=dose_mg_kg,fill=drug)) +
+  geom_histogram(aes(y=after_stat(density)),binwidth=0.02,colour="white",linewidth=0.2,alpha=0.85) +
+  geom_density(aes(colour=drug),linewidth=0.8,fill=NA) +
+  geom_vline(data=ref_lines %>%
+               mutate(drug_label=factor(recode(drug,!!!drug_labels),levels=c("Etomidate","Ketamine"))),
+             aes(xintercept=xint,linetype=linetype,colour=colour),linewidth=0.75) +
+  geom_vline(data=dose_medians,aes(xintercept=med),colour="#2ECC71",linewidth=1.1) +
+  geom_text(data=dose_medians,
+            aes(x=med,y=Inf,label=paste0("Site median\n",round(med,2)," mg/kg")),
+            hjust=-0.08,vjust=1.4,size=3.2,colour="#1A7A3A",fontface="bold",inherit.aes=FALSE) +
+  scale_fill_manual(values=drug_colours,labels=drug_labels,name=NULL) +
+  scale_colour_manual(values=c("#2E75B6"="#2E75B6","#E67E22"="#E67E22",
+                               "#C0392B"="#C0392B","#1F3864"="#1F3864","#7F7F7F"="#7F7F7F"),guide="none") +
+  scale_linetype_identity() +
+  facet_wrap(~drug_label,scales="free",ncol=2) +
+  labs(title="Induction Dose Distribution by Drug",
+       subtitle="Density histogram with RSI Trial reference lines and site median",
+       x="Dose (mg/kg)",y="Density",
+       caption=paste0(site_caption,"\nSolid=standard | Dashed=reduced threshold | Dotted=RSI Trial median | Green=site median")) +
+  theme_pilot() + theme(legend.position="none")
+
+ggsave(out_fig("fig_dose_histogram.png"),plot=p_hist,width=12,height=6,dpi=180)
+p_hist
+```
+
+## 3c. Dose Tier Distribution
+
+```{r dose-tiers}
+dose_tiers <- df %>%
+  filter(!is.na(dose_tier)) %>%
+  mutate(dose_tier=factor(dose_tier,levels=tier_levels)) %>%
+  count(drug,dose_tier,.drop=FALSE) %>%
+  group_by(drug) %>% mutate(pct=n/sum(n)*100) %>% ungroup() %>%
+  mutate(site_id=SITE_ID)
+write_csv(dose_tiers,out_tbl("dose_tier_counts.csv"))
+
+tier_data_fig <- df %>% filter(!is.na(dose_tier)) %>%
+  mutate(tier=factor(dose_tier,levels=tier_levels,labels=tier_labels),
+         drug_label=factor(recode(drug,!!!drug_labels),levels=c("Etomidate","Ketamine"))) %>%
+  count(drug,drug_label,tier,.drop=FALSE) %>%
+  group_by(drug,drug_label) %>% mutate(pct=n/sum(n)*100,total=sum(n)) %>% ungroup()
+
+p_tier <- ggplot(tier_data_fig,aes(x=drug_label,y=pct,fill=tier)) +
+  geom_col(width=0.55,colour="white",linewidth=0.4) +
+  geom_text(aes(label=paste0(round(pct,1),"%")),
+            position=position_stack(vjust=0.5),size=4,fontface="bold",colour="white") +
+  geom_text(data=tier_data_fig %>% distinct(drug_label,total),
+            aes(x=drug_label,y=-3.5,label=paste0("n = ",comma(total))),
+            size=3.5,colour="#555555",inherit.aes=FALSE) +
+  scale_fill_manual(values=tier_colours,name="Dose tier") +
+  scale_y_continuous(labels=function(x) paste0(x,"%"),
+                     limits=c(-5,105),breaks=seq(0,100,25),expand=c(0,0)) +
+  labs(title="Dose Tier Distribution by Drug",
+       subtitle=paste0("Etomidate: reduced <0.20 | int-reduced 0.20-0.24 | int-full 0.25-0.29 | full \u22650.30 mg/kg\n",
+                       "Ketamine:  reduced <1.0  | int-reduced 1.0-1.49  | int-full 1.5-1.99  | full \u22652.0 mg/kg"),
+       x=NULL,y="Proportion of encounters (%)",caption=site_caption) +
+  theme_pilot() + theme(legend.position="right")
+
+ggsave(out_fig("fig_dose_tier_bar.png"),plot=p_tier,width=8,height=7,dpi=180)
+p_tier
+```
+
+## 3d–3e. Provider and Hospital Summaries
+
+```{r provider-summaries}
+hosp_dose_summary <- df %>%
+  group_by(hospital_id,drug) %>%
+  summarise(n=n(),dose_mgkg_median=median(dose_mg_kg,na.rm=TRUE),
+            dose_mgkg_q1=quantile(dose_mg_kg,0.25,na.rm=TRUE),
+            dose_mgkg_q3=quantile(dose_mg_kg,0.75,na.rm=TRUE),
+            dose_mgkg_mean=mean(dose_mg_kg,na.rm=TRUE),
+            dose_mgkg_sd=sd(dose_mg_kg,na.rm=TRUE),
+            pct_reduced=mean(dose_reduced==1,na.rm=TRUE)*100,.groups="drop") %>%
+  mutate(site_id=SITE_ID)
+write_csv(hosp_dose_summary,out_tbl("hospital_dose_summary.csv"))
+
+prov_dose_summary <- df %>%
+  group_by(provider_id,drug) %>%
+  summarise(n=n(),dose_mgkg_median=median(dose_mg_kg,na.rm=TRUE),
+            dose_mgkg_q1=quantile(dose_mg_kg,0.25,na.rm=TRUE),
+            dose_mgkg_q3=quantile(dose_mg_kg,0.75,na.rm=TRUE),
+            dose_mgkg_mean=mean(dose_mg_kg,na.rm=TRUE),
+            dose_mgkg_sd=sd(dose_mg_kg,na.rm=TRUE),
+            pct_reduced=mean(dose_reduced==1,na.rm=TRUE)*100,.groups="drop") %>%
+  filter(n >= min_encounters_provider) %>%
+  group_by(drug) %>%
+  mutate(provider_id=rank(dose_mgkg_median,ties.method="first")) %>%
+  ungroup() %>% mutate(site_id=SITE_ID)
+write_csv(prov_dose_summary,out_tbl("provider_dose_summary.csv"))
+cat("Hospital and provider dose summaries exported.\n")
+
+# Provider caterpillar plots (code-folded — figures saved to output folder)
+prov_dose_plot_data <- prov_dose_summary %>%
+  filter(n >= min_encounters_provider) %>%
+  group_by(drug) %>%
+  mutate(provider_rank=rank(dose_mgkg_median,ties.method="first"),
+         ref_line=if_else(drug=="etomidate",0.30,2.00),
+         thresh_line=if_else(drug=="etomidate",0.25,1.50)) %>%
+  ungroup()
+
+if (nrow(prov_dose_plot_data) > 0) {
+  p_caterpillar_dose <- prov_dose_plot_data %>%
+    ggplot(aes(x=provider_rank,y=dose_mgkg_median,colour=drug)) +
+    geom_hline(aes(yintercept=ref_line),linetype="dashed",colour="grey40",linewidth=0.6) +
+    geom_hline(aes(yintercept=thresh_line),linetype="dotted",colour="#C0392B",linewidth=0.6) +
+    geom_errorbar(aes(ymin=dose_mgkg_q1,ymax=dose_mgkg_q3),width=0,linewidth=0.4) +
+    geom_point(aes(size=n),alpha=0.8) +
+    scale_colour_manual(values=drug_colours,guide="none") +
+    scale_size_continuous(range=c(1,4),name="N encounters") +
+    facet_wrap(~drug,scales="free",ncol=2) +
+    labs(title=paste0("Provider-level dose variation — ",SITE_ID),
+         subtitle=paste0("Providers >= ",min_encounters_provider," encounters | Dashed=reference | Dotted red=reduced threshold"),
+         x="Provider (ranked by median dose, identities suppressed)",y="Dose (mg/kg)") +
+    theme_pilot() + theme(axis.text.x=element_blank(),axis.ticks.x=element_blank())
+
+  ggsave(out_fig("03_provider_caterpillar_dose.png"),
+         plot=p_caterpillar_dose,width=12,height=6,dpi=150)
+  p_caterpillar_dose
+}
+
+prov_drug_choice <- df %>%
+  group_by(provider_id) %>%
+  summarise(n=n(),n_ketamine=sum(drug=="ketamine"),n_etomidate=sum(drug=="etomidate"),
+            pct_ketamine=round(n_ketamine/n*100,1),.groups="drop") %>%
+  filter(n >= min_encounters_provider) %>%
+  arrange(pct_ketamine) %>%
+  mutate(provider_rank=row_number(),
+         predominant=case_when(pct_ketamine>=75~"Predominantly ketamine (>=75%)",
+                               pct_ketamine<=25~"Predominantly etomidate (<=25%)",
+                               TRUE~"Mixed (26-74%)"),
+         predominant=factor(predominant,levels=c("Predominantly etomidate (<=25%)",
+                                                  "Mixed (26-74%)",
+                                                  "Predominantly ketamine (>=75%)"))) %>%
+  mutate(provider_id=rank(pct_ketamine,ties.method="first"))
+
+if (nrow(prov_drug_choice) > 0) {
+  p_caterpillar_drug <- prov_drug_choice %>%
+    ggplot(aes(x=provider_rank,y=pct_ketamine,colour=predominant,size=n)) +
+    geom_hline(yintercept=50,linetype="dashed",colour="grey50",linewidth=0.6) +
+    geom_hline(yintercept=c(25,75),linetype="dotted",colour="grey70",linewidth=0.5) +
+    geom_point(alpha=0.85) +
+    scale_colour_manual(values=c("Predominantly etomidate (<=25%)"="#2E75B6",
+                                  "Mixed (26-74%)"="#7F7F7F",
+                                  "Predominantly ketamine (>=75%)"="#C0392B")) +
+    scale_size_continuous(range=c(1.5,5),name="N encounters") +
+    scale_y_continuous(limits=c(0,100),labels=function(x) paste0(x,"%")) +
+    labs(title=paste0("Provider-level drug choice — ",SITE_ID),
+         subtitle=paste0("Providers >= ",min_encounters_provider," encounters | identities suppressed"),
+         x="Provider (ranked by % ketamine)",y="% encounters using ketamine",colour=NULL) +
+    theme_pilot() + theme(axis.text.x=element_blank(),axis.ticks.x=element_blank())
+
+  ggsave(out_fig("03_provider_caterpillar_drug_choice.png"),
+         plot=p_caterpillar_drug,width=10,height=6,dpi=150)
+  write_csv(prov_drug_choice %>% mutate(site_id=SITE_ID),
+            out_tbl("03_provider_drug_choice_summary.csv"))
+  p_caterpillar_drug
+}
+```
+
+---
+
+# Section 4 — Primary LMM + Variance Decomposition
+
+```{r primary-lmm}
+fixed_fx <- "dose_mg_kg ~ age_s + sex_category + race_eth + cci_s +
+             sbp_s + hr_s + spo2_s + any_vasopressor_6hrs_prior +
+             presumed_infection_7d_prior + ASE_7d_prior +
+             location_group + hospital_type + calendar_year_c"
+
+drop_singular_terms <- function(data, fixed_formula_str) {
+  vars <- trimws(unlist(strsplit(gsub(".*~","",gsub("\\+|\\*|\\:","",fixed_formula_str)),"\\s+")))
+  vars <- vars[vars != "" & !grepl("^[0-9]",vars)]
+  drop <- vars[sapply(vars, function(v) {
+    if (!v %in% names(data)) return(FALSE)
+    x <- data[[v]]
+    if (is.numeric(x)) return(var(x,na.rm=TRUE)==0)
+    return(n_distinct(x,na.rm=TRUE) < 2)
+  })]
+  if (length(drop)>0) {
+    cat("    Dropping single-level terms:",paste(drop,collapse=", "),"\n")
+    for (v in drop) fixed_formula_str <- gsub(paste0("\\+?\\s*",v,"\\b"),"",fixed_formula_str)
+    fixed_formula_str <- trimws(gsub("\\s+"," ",fixed_formula_str))
+  }
+  fixed_formula_str
+}
+
+safe_lmer <- function(formula,data,...) {
+  tryCatch(withCallingHandlers(lmer(formula,data=data,...),
+    warning=function(w){cat("    Warning:",conditionMessage(w),"\n");invokeRestart("muffleWarning")}),
+    error=function(e){cat("    Error:",conditionMessage(e),"\n");NULL})
+}
+
+fit_lmm <- function(data, drug_label) {
+  cat(sprintf("\n  Fitting LMM: %s (n=%d)\n",drug_label,nrow(data)))
+  n_hosp <- n_distinct(data$hospital_id); n_prov <- n_distinct(data$provider_id)
+  cat(sprintf("    Hospitals: %d | Providers: %d\n",n_hosp,n_prov))
+
+  fixed_fx_use   <- drop_singular_terms(data,fixed_fx)
+  formula_3level <- as.formula(paste(fixed_fx_use,"+ (1 | hospital_id/provider_id)"))
+  formula_2level <- as.formula(paste(fixed_fx_use,"+ (1 | hospital_id)"))
+  formula_1hosp  <- as.formula(paste(fixed_fx_use,"+ (1 | provider_id)"))
+
+  m <- NULL; model_used <- NULL
+  lmer_ctrl <- lmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5))
+
+  if (n_hosp==1) {
+    m <- safe_lmer(formula_1hosp,data=data,REML=TRUE,control=lmer_ctrl)
+    if (!is.null(m)&&isSingular(m)) cat("    Singular — interpret cautiously.\n")
+    if (!is.null(m)) model_used <- "1-hosp (patient/provider)"
+  } else if (prefer_3level && n_hosp>=2 && n_prov>=5) {
+    m <- safe_lmer(formula_3level,data=data,REML=TRUE,control=lmer_ctrl)
+    if (!is.null(m)&&isSingular(m)){cat("    3-level singular — falling back.\n");m<-NULL}
+    if (!is.null(m)) model_used <- "3-level (patient/provider/hospital)"
+  }
+  if (is.null(m)&&n_hosp>=2) {
+    m <- safe_lmer(formula_2level,data=data,REML=TRUE,control=lmer_ctrl)
+    if (!is.null(m)) model_used <- "2-level (patient/hospital)"
+  }
+  if (is.null(m)){cat("    SKIPPING — model failed.\n");return(NULL)}
+  cat(sprintf("    Converged: %s\n",model_used))
+
+  vc        <- as.data.frame(VarCorr(m))
+  resid_var <- sigma(m)^2
+  vc_tbl    <- vc %>% select(grp,vcov) %>% rename(group=grp,variance=vcov) %>%
+                filter(group!="Residual")
+  total_var <- sum(vc_tbl$variance)+resid_var
+
+  vc_full <- bind_rows(vc_tbl,tibble(group="Residual",variance=resid_var)) %>%
+    mutate(pct_variance=variance/total_var*100, sd_component=sqrt(variance),
+           drug=drug_label, model_type=model_used, total_var=total_var, site_id=SITE_ID)
+
+  var_hosp <- vc_tbl %>% filter(grepl("hospital_id",group)&!grepl("provider_id",group)) %>%
+    pull(variance) %>% sum()
+  var_prov <- vc_tbl %>% filter(grepl("provider_id",group)) %>% pull(variance) %>% sum()
+
+  icc_tbl <- tibble(drug=drug_label,model_type=model_used,var_hospital=var_hosp,
+                    var_provider=var_prov, icc_hospital=var_hosp/total_var,
+                    icc_provider=(var_hosp+var_prov)/total_var,
+                    single_hosp_site=(n_hosp==1), site_id=SITE_ID)
+
+  fe <- tidy(m,effects="fixed") %>%
+    mutate(drug=drug_label,model_type=model_used,site_id=SITE_ID)
+
+  cat("    Bootstrapping VPC CIs (1000 resamples)...\n")
+  boot_fn <- function(data,indices) {
+    d <- data[indices,]
+    form <- if (model_used=="3-level (patient/provider/hospital)") formula_3level
+            else if (model_used=="1-hosp (patient/provider)") formula_1hosp
+            else formula_2level
+    m_b <- tryCatch(suppressWarnings(lmer(form,data=d,REML=TRUE,
+                    control=lmerControl(optimizer="bobyqa",optCtrl=list(maxfun=1e5)))),
+                    error=function(e) NULL)
+    if (is.null(m_b)) return(rep(NA_real_,nrow(vc_tbl)+1))
+    vc_b <- as.data.frame(VarCorr(m_b)) %>% filter(grp!="Residual") %>% pull(vcov)
+    res_b <- sigma(m_b)^2; tot_b <- sum(vc_b)+res_b
+    c(vc_b/tot_b*100,res_b/tot_b*100)
+  }
+  set.seed(20260319)
+  boot_res <- tryCatch(boot(data=data,statistic=boot_fn,R=1000),
+                       error=function(e){cat("    Bootstrap failed.\n");NULL})
+  if (!is.null(boot_res)) {
+    ci_df <- map_dfr(seq_len(ncol(boot_res$t)),function(i) {
+      ci <- tryCatch(boot.ci(boot_res,type="perc",index=i)$percent[4:5],
+                     error=function(e) c(NA_real_,NA_real_))
+      tibble(ci_lo=ci[1],ci_hi=ci[2])
+    })
+    vc_full <- vc_full %>% mutate(ci_lo=ci_df$ci_lo,ci_hi=ci_df$ci_hi)
+  } else {
+    vc_full <- vc_full %>% mutate(ci_lo=NA_real_,ci_hi=NA_real_)
+  }
+  list(variance_components=vc_full,fixed_effects=fe,icc=icc_tbl,model=m)
+}
+
+lmm_etomidate <- fit_lmm(df_etomidate,"etomidate")
+lmm_ketamine  <- fit_lmm(df_ketamine, "ketamine")
+
+bind_rows(lmm_etomidate$variance_components,lmm_ketamine$variance_components) %>%
+  write_csv(out_mod("variance_components.csv"))
+bind_rows(lmm_etomidate$fixed_effects,lmm_ketamine$fixed_effects) %>%
+  write_csv(out_mod("fixed_effects.csv"))
+bind_rows(lmm_etomidate$icc,lmm_ketamine$icc) %>%
+  write_csv(out_mod("icc_results.csv"))
+
+cat("\nVariance decomposition exported.\n")
+
+# Display variance components
+bind_rows(lmm_etomidate$variance_components, lmm_ketamine$variance_components) %>%
+  select(drug, group, variance, pct_variance, ci_lo, ci_hi, model_type) %>%
+  knitr::kable(digits=3, caption="Variance components by drug")
+```
+
+```{r variance-decomp-figure}
+if (!is.null(lmm_etomidate) | !is.null(lmm_ketamine)) {
+  clean_group <- function(g) case_when(
+    grepl("hospital_id:provider_id|provider_id:hospital_id",g) ~ "Provider\n(within hospital)",
+    grepl("provider_id",g)&!grepl("hospital_id",g)            ~ "Provider",
+    grepl("hospital_id",g)&!grepl("provider_id",g)            ~ "Hospital / Site",
+    g=="Residual"                                              ~ "Residual\n(unexplained)",
+    TRUE~g)
+
+  vc_data <- bind_rows(lmm_etomidate$variance_components,lmm_ketamine$variance_components) %>%
+    mutate(component=clean_group(group),
+           drug_label=factor(recode(drug,!!!drug_labels),levels=c("Etomidate","Ketamine")),
+           comp_order=case_when(grepl("Hospital",component)~1,grepl("Provider",component)~2,
+                                grepl("Residual",component)~3,TRUE~4)) %>%
+    arrange(drug_label,comp_order)
+
+  comp_colours <- c("Hospital / Site"="#2E75B6","Provider\n(within hospital)"="#E67E22",
+                    "Provider"="#E67E22","Residual\n(unexplained)"="#BDC3C7")
+  has_ci <- !all(is.na(vc_data$ci_lo))
+
+  p_vc <- ggplot(vc_data,aes(x=reorder(component,comp_order),y=pct_variance,fill=component)) +
+    geom_col(width=0.6,colour="white",linewidth=0.3) +
+    {if(has_ci) geom_errorbar(aes(ymin=ci_lo,ymax=ci_hi),width=0.18,linewidth=0.7,colour="#333333")} +
+    geom_text(aes(label=paste0(round(pct_variance,1),"%")),vjust=-0.6,size=4,
+              fontface="bold",colour="#1F3864") +
+    scale_fill_manual(values=comp_colours,guide="none") +
+    scale_y_continuous(labels=function(x) paste0(x,"%"),
+                       limits=c(0,max(vc_data$pct_variance,na.rm=TRUE)*1.25),expand=c(0,0)) +
+    facet_wrap(~drug_label,ncol=2) +
+    labs(title="Variance Decomposition: Sources of Dose Variability",
+         subtitle=paste0("% total variance by component",
+                         if(has_ci) " | Error bars = bootstrap 95% CI (1,000 resamples)" else ""),
+         x="Variance component",y="% of total variance",
+         caption=paste0(site_caption,"\nPRELIMINARY — single-site; interpret in context of full pooled analysis.")) +
+    theme_pilot() +
+    theme(plot.caption=element_text(size=9,colour="#C0392B",hjust=0,face="italic"))
+
+  ggsave(out_fig("fig_variance_decomposition.png"),plot=p_vc,width=11,height=7,dpi=180)
+  p_vc
+}
+```
+
+---
+
+# Section 5 — Sensitivity Analyses
+
+```{r sa-5a-rawmg, results='hide'}
+# SA 5a: Raw mg dose LMM (code folded — results in output folder)
+fixed_rawmg <- sub("dose_mg_kg ~","induction_dose_mg ~",fixed_fx)
+safe_lmer_sa <- safe_lmer
+
+fit_lmm_rawmg <- function(data,drug_label) {
+  cat(sprintf("\n  SA 5a raw-mg LMM: %s\n",drug_label))
+  n_hosp <- n_distinct(data$hospital_id); n_prov <- n_distinct(data$provider_id)
+  fixed_fx_use   <- drop_singular_terms(data,fixed_rawmg)
+  formula_3level <- as.formula(paste(fixed_fx_use,"+ (1 | hospital_id/provider_id)"))
+  formula_2level <- as.formula(paste(fixed_fx_use,"+ (1 | hospital_id)"))
+  formula_1hosp  <- as.formula(paste(fixed_fx_use,"+ (1 | provider_id)"))
+  m <- NULL; model_used <- NULL
+  lmer_ctrl <- lmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5))
+  if (n_hosp==1) {
+    m <- safe_lmer(formula_1hosp,data=data,REML=TRUE,control=lmer_ctrl)
+    if (!is.null(m)) model_used <- "1-hosp (patient/provider)"
+  } else if (prefer_3level&&n_hosp>=2&&n_prov>=5) {
+    m <- safe_lmer(formula_3level,data=data,REML=TRUE,control=lmer_ctrl)
+    if (!is.null(m)&&isSingular(m)){m<-NULL}
+    if (!is.null(m)) model_used <- "3-level (patient/provider/hospital)"
+  }
+  if (is.null(m)&&n_hosp>=2){m<-safe_lmer(formula_2level,data=data,REML=TRUE,control=lmer_ctrl);if(!is.null(m))model_used<-"2-level (patient/hospital)"}
+  if (is.null(m)){cat("    SKIPPING\n");return(NULL)}
+  vc<-as.data.frame(VarCorr(m));resid_var<-sigma(m)^2
+  vc_tbl<-vc%>%select(grp,vcov)%>%rename(group=grp,variance=vcov)%>%filter(group!="Residual")
+  total_var<-sum(vc_tbl$variance)+resid_var
+  vc_full<-bind_rows(vc_tbl,tibble(group="Residual",variance=resid_var))%>%
+    mutate(pct_variance=variance/total_var*100,sd_component=sqrt(variance),
+           drug=drug_label,model_type=model_used,total_var=total_var,
+           outcome="induction_dose_mg",site_id=SITE_ID)
+  var_hosp<-vc_tbl%>%filter(grepl("hospital_id",group)&!grepl("provider_id",group))%>%pull(variance)%>%sum()
+  var_prov<-vc_tbl%>%filter(grepl("provider_id",group))%>%pull(variance)%>%sum()
+  icc_tbl<-tibble(drug=drug_label,outcome="induction_dose_mg",model_type=model_used,
+                  var_hospital=var_hosp,var_provider=var_prov,
+                  icc_hospital=var_hosp/total_var,icc_provider=(var_hosp+var_prov)/total_var,
+                  single_hosp_site=(n_hosp==1),site_id=SITE_ID)
+  fe<-tidy(m,effects="fixed")%>%mutate(drug=drug_label,outcome="induction_dose_mg",model_type=model_used,site_id=SITE_ID)
+  set.seed(20260319)
+  boot_fn_rawmg<-function(data,indices){d<-data[indices,];form<-if(model_used=="3-level (patient/provider/hospital)")formula_3level else if(model_used=="1-hosp (patient/provider)")formula_1hosp else formula_2level;m_b<-tryCatch(suppressWarnings(lmer(form,data=d,REML=TRUE,control=lmerControl(optimizer="bobyqa",optCtrl=list(maxfun=1e5)))),error=function(e)NULL);if(is.null(m_b))return(rep(NA_real_,nrow(vc_tbl)+1));vc_b<-as.data.frame(VarCorr(m_b))%>%filter(grp!="Residual")%>%pull(vcov);res_b<-sigma(m_b)^2;tot_b<-sum(vc_b)+res_b;c(vc_b/tot_b*100,res_b/tot_b*100)}
+  boot_res<-tryCatch(boot(data=data,statistic=boot_fn_rawmg,R=500),error=function(e)NULL)
+  if(!is.null(boot_res)){ci_df<-map_dfr(seq_len(ncol(boot_res$t)),function(i){ci<-tryCatch(boot.ci(boot_res,type="perc",index=i)$percent[4:5],error=function(e)c(NA_real_,NA_real_));tibble(ci_lo=ci[1],ci_hi=ci[2])});vc_full<-vc_full%>%mutate(ci_lo=ci_df$ci_lo,ci_hi=ci_df$ci_hi)}else{vc_full<-vc_full%>%mutate(ci_lo=NA_real_,ci_hi=NA_real_)}
+  list(variance_components=vc_full,fixed_effects=fe,icc=icc_tbl)
+}
+
+sa_rawmg_etom <- fit_lmm_rawmg(df_etomidate,"etomidate")
+sa_rawmg_keta <- fit_lmm_rawmg(df_ketamine, "ketamine")
+bind_rows(sa_rawmg_etom$variance_components,sa_rawmg_keta$variance_components) %>% write_csv(out_mod("sa_rawmg_variance_components.csv"))
+bind_rows(sa_rawmg_etom$fixed_effects,sa_rawmg_keta$fixed_effects) %>% write_csv(out_mod("sa_rawmg_fixed_effects.csv"))
+bind_rows(sa_rawmg_etom$icc,sa_rawmg_keta$icc) %>% write_csv(out_mod("sa_rawmg_icc_results.csv"))
+cat("SA 5a exported.\n")
+```
+
+```{r sa-5b-provider-fixed, results='hide'}
+# SA 5b: Provider as fixed effect — exported, not displayed inline
+compute_r2_lmer <- function(m) {
+  tryCatch({
+    vc<-as.data.frame(VarCorr(m));var_f<-var(as.vector(model.matrix(m)%*%fixef(m)))
+    var_r<-sum(vc$vcov[vc$grp!="Residual"]);var_e<-sigma(m)^2
+    tibble(r2_marginal=round(var_f/(var_f+var_r+var_e),4),
+           r2_conditional=round((var_f+var_r)/(var_f+var_r+var_e),4))
+  },error=function(e) tibble(r2_marginal=NA_real_,r2_conditional=NA_real_))
+}
+
+fit_lmm_provider_fixed <- function(data,drug_label) {
+  n_hosp<-n_distinct(data$hospital_id);n_prov<-n_distinct(data$provider_id)
+  if(n_prov>nrow(data)/10) cat(sprintf("    NOTE: %d providers / %d obs — may be rank-deficient.\n",n_prov,nrow(data)))
+  fixed_fx_use<-drop_singular_terms(data,fixed_fx)
+  if(n_hosp==1){formula_pf<-as.formula(paste(fixed_fx_use,"+ factor(provider_id)"));formula_noprov<-as.formula(paste(fixed_fx_use,"+ 1"))}else{formula_pf<-as.formula(paste(fixed_fx_use,"+ factor(provider_id) + (1 | hospital_id)"));formula_noprov<-as.formula(paste(fixed_fx_use,"+ (1 | hospital_id)"))}
+  lmer_ctrl<-lmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5))
+  m_pf<-tryCatch(withCallingHandlers(if(n_hosp==1)lm(formula_pf,data=data)else lmer(formula_pf,data=data,REML=FALSE,control=lmer_ctrl),warning=function(w){cat("    Warning:",conditionMessage(w),"\n");invokeRestart("muffleWarning")}),error=function(e){cat("    Provider-fixed model failed:",conditionMessage(e),"\n");NULL})
+  if(is.null(m_pf))return(NULL)
+  m_null<-tryCatch(withCallingHandlers(if(n_hosp==1)lm(formula_noprov,data=data)else lmer(formula_noprov,data=data,REML=FALSE,control=lmer_ctrl),warning=function(w)invokeRestart("muffleWarning")),error=function(e)NULL)
+  lrt_result<-if(!is.null(m_null)){tryCatch({lt<-anova(m_null,m_pf);tibble(lrt_chisq=round(lt$Chisq[2],3),lrt_df=lt$`Chi Df`[2],lrt_p=round(lt$`Pr(>Chisq)`[2],4),lrt_note=if(lt$`Pr(>Chisq)`[2]<0.05)"Significant (p<0.05)"else"Not significant")},error=function(e)tibble(lrt_chisq=NA,lrt_df=NA,lrt_p=NA,lrt_note="LRT failed"))}else tibble(lrt_chisq=NA,lrt_df=NA,lrt_p=NA,lrt_note="Null model failed")
+  r2_vals<-if(n_hosp>1)compute_r2_lmer(m_pf)else{r2<-summary(m_pf)$r.squared;tibble(r2_marginal=round(r2,4),r2_conditional=NA_real_)}
+  bind_cols(tibble(drug=drug_label,n=nrow(data),n_providers=n_prov,n_hospitals=n_hosp,model_type=if(n_hosp==1)"lm (single hospital)"else"lmer (multi-hospital)",rank_deficiency_warning=(n_prov>nrow(data)/10),site_id=SITE_ID),lrt_result,r2_vals)
+}
+
+sa_pf_etom<-fit_lmm_provider_fixed(df_etomidate,"etomidate")
+sa_pf_keta<-fit_lmm_provider_fixed(df_ketamine, "ketamine")
+bind_rows(sa_pf_etom,sa_pf_keta) %>% write_csv(out_mod("sa_provider_fixed_lrt.csv"))
+cat("SA 5b exported.\n")
+```
+
+```{r sa-5c-drug-choice, results='hide'}
+# SA 5c: Provider drug choice mOR
+fixed_drugchoice <- "~ age_s + sex_category + race_eth + cci_s +
+                       sbp_s + hr_s + spo2_s + any_vasopressor_6hrs_prior +
+                       presumed_infection_7d_prior + ASE_7d_prior +
+                       location_group + hospital_type + calendar_year_c"
+
+safe_glmer <- function(formula,data,...) {
+  tryCatch(withCallingHandlers(glmer(formula,data=data,...),
+    warning=function(w){cat("    Warning:",conditionMessage(w),"\n");invokeRestart("muffleWarning")}),
+    error=function(e){cat("    Error:",conditionMessage(e),"\n");NULL})
+}
+
+n_hosp_dc<-n_distinct(df$hospital_id)
+fixed_dc_use<-drop_singular_terms(df,fixed_drugchoice)
+glmer_ctrl<-glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5))
+formula_dc_3l<-as.formula(paste("drug_ketamine",fixed_dc_use,"+ (1 | hospital_id/provider_id)"))
+formula_dc_2l<-as.formula(paste("drug_ketamine",fixed_dc_use,"+ (1 | hospital_id)"))
+formula_dc_1h<-as.formula(paste("drug_ketamine",fixed_dc_use,"+ (1 | provider_id)"))
+m_dc<-NULL;model_dc_used<-NULL
+if(n_hosp_dc==1){m_dc<-safe_glmer(formula_dc_1h,data=df,family=binomial,control=glmer_ctrl);if(!is.null(m_dc))model_dc_used<-"1-hosp (patient/provider)"}else if(prefer_3level&&n_hosp_dc>=2&&n_distinct(df$provider_id)>=5){m_dc<-safe_glmer(formula_dc_3l,data=df,family=binomial,control=glmer_ctrl);if(!is.null(m_dc)&&isSingular(m_dc))m_dc<-NULL;if(!is.null(m_dc))model_dc_used<-"3-level (patient/provider/hospital)"}
+if(is.null(m_dc)&&n_hosp_dc>=2){m_dc<-safe_glmer(formula_dc_2l,data=df,family=binomial,control=glmer_ctrl);if(!is.null(m_dc))model_dc_used<-"2-level (patient/hospital)"}
+if(!is.null(m_dc)){
+  vc_dc<-as.data.frame(VarCorr(m_dc));pi2_3<-pi^2/3
+  var_hosp_dc<-vc_dc%>%filter(grepl("hospital_id",grp)&!grepl("provider_id",grp))%>%pull(vcov)%>%sum()
+  var_prov_dc<-vc_dc%>%filter(grepl("provider_id",grp))%>%pull(vcov)%>%sum()
+  total_dc<-var_hosp_dc+var_prov_dc+pi2_3
+  dc_summary<-tibble(outcome="drug_ketamine",model_type=model_dc_used,single_hosp_site=(n_hosp_dc==1),n=nrow(df),n_ketamine=sum(df$drug_ketamine==1),pct_ketamine=mean(df$drug_ketamine==1)*100,var_hospital=var_hosp_dc,var_provider=var_prov_dc,icc_hospital=var_hosp_dc/total_dc,icc_provider=(var_hosp_dc+var_prov_dc)/total_dc,mor_hospital=if(var_hosp_dc>0)exp(sqrt(2*var_hosp_dc)*qnorm(0.75))else NA_real_,mor_provider=if(var_prov_dc>0)exp(sqrt(2*var_prov_dc)*qnorm(0.75))else NA_real_,location_group_in_model=TRUE,site_id=SITE_ID)
+  dc_fe<-tidy(m_dc,effects="fixed",exponentiate=TRUE,conf.int=TRUE)%>%mutate(outcome="drug_ketamine",model_type=model_dc_used,site_id=SITE_ID)
+  write_csv(dc_summary,out_mod("sa_drug_choice_mor_icc.csv"))
+  write_csv(dc_fe,out_mod("sa_drug_choice_fixed_effects.csv"))
+  cat("SA 5c exported.\n")
+}
+```
+
+---
+
+# Section 6 — Aim 4: Logistic Models + mOR
+
+```{r aim4-models, results='hide'}
+fixed_logit_base <- "~ age_s + sex_category + race_eth + cci_s +
+                      sbp_s + hr_s + spo2_s + any_vasopressor_6hrs_prior +
+                      presumed_infection_7d_prior + ASE_7d_prior +
+                      location_group + hospital_type + calendar_year_c"
+
+fit_logistic_re <- function(data,outcome_var,drug_label,model_label) {
+  cat(sprintf("\n  Drug: %s | Outcome: %s (n=%d)\n",drug_label,model_label,nrow(data)))
+  data<-data%>%filter(!is.na(.data[[outcome_var]]))
+  cat(sprintf("    n outcome=1: %d (%.1f%%)\n",sum(data[[outcome_var]]==1),mean(data[[outcome_var]]==1)*100))
+  n_hosp_d<-n_distinct(data$hospital_id)
+  fixed_logit_use<-drop_singular_terms(data,fixed_logit_base)
+  formula_3level<-as.formula(paste(outcome_var,fixed_logit_use,"+ (1 | hospital_id/provider_id)"))
+  formula_2level<-as.formula(paste(outcome_var,fixed_logit_use,"+ (1 | hospital_id)"))
+  formula_1hosp <-as.formula(paste(outcome_var,fixed_logit_use,"+ (1 | provider_id)"))
+  glmer_ctrl<-glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5))
+  m<-NULL;model_used<-NULL
+  if(n_hosp_d==1){m<-safe_glmer(formula_1hosp,data=data,family=binomial,control=glmer_ctrl);if(!is.null(m)&&isSingular(m))cat("    Singular — retaining with caution.\n");if(!is.null(m))model_used<-"1-hosp (patient/provider)"}else if(prefer_3level&&n_hosp_d>=2&&n_distinct(data$provider_id)>=5){m<-safe_glmer(formula_3level,data=data,family=binomial,control=glmer_ctrl);if(!is.null(m)&&isSingular(m))m<-NULL;if(!is.null(m))model_used<-"3-level (patient/provider/hospital)"}
+  if(is.null(m)&&n_hosp_d>=2){m<-safe_glmer(formula_2level,data=data,family=binomial,control=glmer_ctrl);if(!is.null(m))model_used<-"2-level (patient/hospital)"}
+  if(is.null(m)){cat("    Model failed.\n");return(NULL)}
+  cat(sprintf("    Converged: %s\n",model_used))
+  vc<-as.data.frame(VarCorr(m));pi2_3<-pi^2/3
+  var_hosp<-vc%>%filter(grepl("hospital_id",grp)&!grepl("provider_id",grp))%>%pull(vcov)%>%sum()
+  var_prov<-vc%>%filter(grepl("provider_id",grp))%>%pull(vcov)%>%sum()
+  total_v<-var_hosp+var_prov+pi2_3
+  results<-tibble(drug=drug_label,outcome=model_label,model_type=model_used,single_hosp_site=(n_hosp_d==1),n=nrow(data),n_outcome=sum(data[[outcome_var]]==1),pct_outcome=mean(data[[outcome_var]]==1)*100,var_hospital=var_hosp,var_provider=var_prov,icc_hospital=var_hosp/total_v,icc_provider=(var_hosp+var_prov)/total_v,mor_hospital=if(var_hosp>0)exp(sqrt(2*var_hosp)*qnorm(0.75))else NA_real_,mor_provider=if(var_prov>0)exp(sqrt(2*var_prov)*qnorm(0.75))else NA_real_,site_id=SITE_ID)
+  fe<-tidy(m,effects="fixed",exponentiate=TRUE,conf.int=TRUE)%>%mutate(drug=drug_label,outcome=model_label,model_type=model_used,site_id=SITE_ID)
+  list(summary=results,fixed_effects=fe)
+}
+
+aim4_etom_thresh<-fit_logistic_re(df_etomidate,"dose_reduced",  "etomidate","threshold_0.25")
+aim4_keta_thresh<-fit_logistic_re(df_ketamine, "dose_reduced",  "ketamine", "threshold_1.5")
+aim4_etom_pct   <-fit_logistic_re(df_etomidate,"dose_low_25pct","etomidate","pct25_below_ref")
+aim4_keta_pct   <-fit_logistic_re(df_ketamine, "dose_low_25pct","ketamine", "pct25_below_ref")
+
+bind_rows(aim4_etom_thresh$summary,aim4_keta_thresh$summary,
+          aim4_etom_pct$summary,aim4_keta_pct$summary) %>%
+  write_csv(out_mod("aim4_mor_icc_results.csv"))
+bind_rows(aim4_etom_thresh$fixed_effects,aim4_keta_thresh$fixed_effects,
+          aim4_etom_pct$fixed_effects,aim4_keta_pct$fixed_effects) %>%
+  write_csv(out_mod("aim4_fixed_effects.csv"))
+cat("Aim 4 primary models exported.\n")
+```
+
+```{r aim4-results-display}
+bind_rows(aim4_etom_thresh$summary, aim4_keta_thresh$summary,
+          aim4_etom_pct$summary,    aim4_keta_pct$summary) %>%
+  select(drug, outcome, model_type, n, pct_outcome, icc_hospital, icc_provider,
+         mor_hospital, mor_provider) %>%
+  knitr::kable(digits=3, caption="Aim 4: mOR and ICC results")
+```
+
+```{r aim4-subgroups, results='hide'}
+fit_subgroup_mor <- function(data,outcome_var,drug_label,subgroup_var,subgroup_val,min_n=50) {
+  d<-data%>%filter(.data[[subgroup_var]]==subgroup_val,!is.na(.data[[outcome_var]]))
+  if(nrow(d)<min_n){cat(sprintf("    SKIP: %s | %s=%s | n=%d\n",drug_label,subgroup_var,subgroup_val,nrow(d)));return(NULL)}
+  n_hosp_d<-n_distinct(d$hospital_id)
+  fixed_logit_use<-drop_singular_terms(d,fixed_logit_base)
+  formula_sg<-if(n_hosp_d==1)as.formula(paste(outcome_var,fixed_logit_use,"+ (1 | provider_id)"))else as.formula(paste(outcome_var,fixed_logit_use,"+ (1 | hospital_id)"))
+  glmer_ctrl<-glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5))
+  m<-safe_glmer(formula_sg,data=d,family=binomial,control=glmer_ctrl)
+  if(is.null(m)||isSingular(m)){cat(sprintf("    SKIP (singular/failed): %s | %s=%s\n",drug_label,subgroup_var,subgroup_val));return(NULL)}
+  vc<-as.data.frame(VarCorr(m));pi2_3<-pi^2/3
+  var_hosp<-vc%>%filter(grepl("hospital_id",grp)&!grepl("provider_id",grp))%>%pull(vcov)%>%sum()
+  var_prov<-vc%>%filter(grepl("provider_id",grp))%>%pull(vcov)%>%sum()
+  var_cluster<-if(n_hosp_d==1)var_prov else var_hosp
+  clustering_level<-if(n_hosp_d==1)"provider"else"hospital"
+  total_v<-var_cluster+pi2_3
+  tibble(drug=drug_label,outcome=outcome_var,subgroup_var=subgroup_var,subgroup_value=as.character(subgroup_val),model_type=if(n_hosp_d==1)"1-hosp (patient/provider)"else"2-level (patient/hospital)",single_hosp_site=(n_hosp_d==1),clustering_level=clustering_level,n=nrow(d),n_outcome=sum(d[[outcome_var]]==1),pct_outcome=mean(d[[outcome_var]]==1)*100,var_hospital=var_hosp,var_provider=var_prov,icc=var_cluster/total_v,mor=exp(sqrt(2*var_cluster)*qnorm(0.75)),site_id=SITE_ID)
+}
+
+subgroup_specs<-list(list(var="hospital_type",vals=unique(df$hospital_type)),
+                     list(var="location_group",vals=unique(df$location_group)),
+                     list(var="ASE_7d_prior",vals=c(0,1)))
+subgroup_results<-list()
+for(drug_label in c("etomidate","ketamine")) {
+  d_drug<-df%>%filter(drug==drug_label)
+  for(spec in subgroup_specs) for(val in spec$vals) {
+    res<-fit_subgroup_mor(d_drug,"dose_reduced",drug_label,spec$var,val)
+    if(!is.null(res)) subgroup_results<-c(subgroup_results,list(res))
+  }
+}
+if(length(subgroup_results)>0) {
+  bind_rows(subgroup_results)%>%write_csv(out_mod("aim4_subgroup_mor_results.csv"))
+  cat(sprintf("Subgroup mOR exported (%d models).\n",length(subgroup_results)))
+}
+```
+
+---
+
+# Section 7 — Time Trends and Location Comparisons
+
+```{r time-trends}
+# Annual dose trends
+df %>% group_by(drug,calendar_year) %>%
+  summarise(n=n(),dose_mgkg_median=median(dose_mg_kg,na.rm=TRUE),
+            dose_mgkg_q1=quantile(dose_mg_kg,0.25,na.rm=TRUE),
+            dose_mgkg_q3=quantile(dose_mg_kg,0.75,na.rm=TRUE),
+            dose_mgkg_mean=mean(dose_mg_kg,na.rm=TRUE),
+            dose_mgkg_sd=sd(dose_mg_kg,na.rm=TRUE),
+            pct_reduced=mean(dose_reduced==1,na.rm=TRUE)*100,
+            pct_low25=mean(dose_low_25pct==1,na.rm=TRUE)*100,.groups="drop") %>%
+  mutate(site_id=SITE_ID) %>% write_csv(out_fig("annual_dose_trends.csv"))
+
+df %>% group_by(drug,calendar_quarter,hospital_type) %>%
+  summarise(n=n(),dose_mgkg_median=median(dose_mg_kg,na.rm=TRUE),
+            dose_mgkg_q1=quantile(dose_mg_kg,0.25,na.rm=TRUE),
+            dose_mgkg_q3=quantile(dose_mg_kg,0.75,na.rm=TRUE),
+            dose_mgkg_sd=sd(dose_mg_kg,na.rm=TRUE),
+            pct_reduced=mean(dose_reduced==1,na.rm=TRUE)*100,.groups="drop") %>%
+  mutate(site_id=SITE_ID) %>% write_csv(out_fig("quarterly_dose_trends.csv"))
+
+df %>% count(calendar_quarter,hospital_type,location_group,drug) %>%
+  group_by(calendar_quarter,hospital_type,location_group) %>%
+  mutate(total=sum(n),pct=n/total*100) %>% ungroup() %>%
+  mutate(site_id=SITE_ID) %>% write_csv(out_fig("drug_choice_by_quarter.csv"))
+
+df %>% count(calendar_year,drug) %>%
+  group_by(calendar_year) %>% mutate(total=sum(n),pct=n/total*100) %>%
+  ungroup() %>% mutate(site_id=SITE_ID) %>% write_csv(out_fig("drug_choice_by_year.csv"))
+
+cat("Trend exports complete.\n")
+```
+
+```{r annual-trends-figure}
+library(patchwork)
+annual_fig <- df %>%
+  group_by(drug,drug_label_f=factor(recode(drug,!!!drug_labels),levels=c("Etomidate","Ketamine")),calendar_year) %>%
+  summarise(n=n(),dose_median=median(dose_mg_kg,na.rm=TRUE),
+            dose_q1=quantile(dose_mg_kg,0.25,na.rm=TRUE),
+            dose_q3=quantile(dose_mg_kg,0.75,na.rm=TRUE),
+            pct_reduced=mean(dose_reduced==1,na.rm=TRUE)*100,.groups="drop")
+
+drug_choice_yr_fig <- df %>% count(calendar_year,drug) %>%
+  group_by(calendar_year) %>% mutate(pct=n/sum(n)*100) %>% ungroup() %>%
+  mutate(drug_label_f=factor(recode(drug,!!!drug_labels),levels=c("Etomidate","Ketamine")))
+
+ref_doses_fig <- tibble(
+  drug_label_f=factor(c("Etomidate","Etomidate","Ketamine","Ketamine"),levels=c("Etomidate","Ketamine")),
+  yref=c(0.30,0.25,2.00,1.25), ltype=c("solid","dashed","solid","dashed"))
+
+pA_fig <- ggplot(annual_fig,aes(x=calendar_year,colour=drug_label_f,fill=drug_label_f)) +
+  geom_ribbon(aes(ymin=dose_q1,ymax=dose_q3),alpha=0.15,colour=NA) +
+  geom_line(aes(y=dose_median),linewidth=1.0) +
+  geom_point(aes(y=dose_median,size=n),alpha=0.9) +
+  geom_hline(data=ref_doses_fig,aes(yintercept=yref,linetype=ltype),
+             colour="#888888",linewidth=0.6,inherit.aes=FALSE) +
+  scale_colour_manual(values=drug_colours,labels=drug_labels,name=NULL) +
+  scale_fill_manual(values=drug_colours,labels=drug_labels,name=NULL) +
+  scale_linetype_identity() +
+  scale_size_continuous(range=c(2,5),name="N encounters") +
+  scale_x_continuous(breaks=seq(yr_min,yr_max,by=1)) +
+  facet_wrap(~drug_label_f,scales="free_y",ncol=2) +
+  labs(title="A \u2014 Median Induction Dose Over Time",x=NULL,y="Dose (mg/kg)") +
+  theme_pilot() + theme(legend.position="none",axis.text.x=element_text(angle=45,hjust=1))
+
+pB_fig <- ggplot(drug_choice_yr_fig,aes(x=calendar_year,y=pct,fill=drug_label_f)) +
+  geom_col(position="stack",width=0.7,colour="white",linewidth=0.3) +
+  geom_hline(yintercept=50,linetype="dashed",colour="#888888",linewidth=0.6) +
+  scale_fill_manual(values=drug_colours,labels=drug_labels,name="Drug") +
+  scale_x_continuous(breaks=seq(yr_min,yr_max,by=1)) +
+  scale_y_continuous(labels=function(x) paste0(x,"%"),limits=c(0,101),expand=c(0,0)) +
+  labs(title="B \u2014 Drug Choice Over Time",x="Calendar year",y="% of encounters") +
+  theme_pilot() + theme(axis.text.x=element_text(angle=45,hjust=1))
+
+p_annual_fig <- pA_fig/pB_fig +
+  plot_annotation(title="Annual Dose and Drug Choice Trends",caption=site_caption,
+    theme=theme(plot.title=element_text(face="bold",size=15,colour="#1F3864"),
+                plot.caption=element_text(size=9,colour="#888888",hjust=0)))
+
+ggsave(out_fig("fig_annual_trends.png"),plot=p_annual_fig,width=12,height=10,dpi=180)
+p_annual_fig
+```
+
+```{r location-comparisons}
+df %>% group_by(drug,location_group) %>%
+  summarise(n=n(),dose_mgkg_median=median(dose_mg_kg,na.rm=TRUE),
+            dose_mgkg_q1=quantile(dose_mg_kg,0.25,na.rm=TRUE),
+            dose_mgkg_q3=quantile(dose_mg_kg,0.75,na.rm=TRUE),
+            dose_mgkg_sd=sd(dose_mg_kg,na.rm=TRUE),
+            pct_reduced=mean(dose_reduced==1,na.rm=TRUE)*100,.groups="drop") %>%
+  mutate(site_id=SITE_ID) %>% write_csv(out_fig("dose_by_location.csv"))
+
+df %>% count(location_group,drug) %>%
+  group_by(location_group) %>% mutate(total=sum(n),pct=n/total*100) %>%
+  ungroup() %>% mutate(site_id=SITE_ID) %>% write_csv(out_fig("drug_choice_by_location.csv"))
+
+# Table 3
+df %>% group_by(drug,hospital_type,location_group) %>%
+  summarise(n=n(),
+            dose_mgkg_median=median(dose_mg_kg,na.rm=TRUE),
+            dose_mgkg_q1=quantile(dose_mg_kg,0.25,na.rm=TRUE),
+            dose_mgkg_q3=quantile(dose_mg_kg,0.75,na.rm=TRUE),
+            dose_mg_median=median(induction_dose_mg,na.rm=TRUE),
+            dose_mg_q1=quantile(induction_dose_mg,0.25,na.rm=TRUE),
+            dose_mg_q3=quantile(induction_dose_mg,0.75,na.rm=TRUE),
+            pct_tier_reduced=mean(dose_tier=="reduced",na.rm=TRUE)*100,
+            pct_tier_int_reduced=mean(dose_tier=="intermediate_reduced",na.rm=TRUE)*100,
+            pct_tier_int_full=mean(dose_tier=="intermediate_full",na.rm=TRUE)*100,
+            pct_tier_full=mean(dose_tier=="full",na.rm=TRUE)*100,
+            pct_reduced_thresh=mean(dose_reduced==1,na.rm=TRUE)*100,
+            pct_low25=mean(dose_low_25pct==1,na.rm=TRUE)*100,
+            pct_vaso_6hr=mean(any_vasopressor_6hrs_prior==1,na.rm=TRUE)*100,
+            pct_ase=mean(ASE_7d_prior==1,na.rm=TRUE)*100,
+            n_miss_dose_mgkg=sum(is.na(dose_mg_kg)),
+            n_miss_sbp_24hr=sum(is.na(worst_sbp_24hr_pre)),
+            n_miss_sbp_6hr=sum(is.na(worst_sbp_6hr_pre)),
+            .groups="drop") %>%
+  mutate(site_id=SITE_ID) %>% write_csv(out_tbl("table3_dose_by_strata.csv"))
+
+cat("Location comparison exports complete.\n")
+```
+
+```{r time-trend-model}
+df_trend <- df %>% mutate(year = calendar_year_c)
+include_hosp_type <- n_distinct(df_trend$hospital_type, na.rm=TRUE) > 1
+
+trend_formula <- if (!single_hosp_site & include_hosp_type) {
+  as.integer(drug=="ketamine") ~ year + hospital_type + (1 | hospital_id)
+} else if (!single_hosp_site) {
+  as.integer(drug=="ketamine") ~ year + (1 | hospital_id)
+} else if (include_hosp_type) {
+  as.integer(drug=="ketamine") ~ year + hospital_type
+} else {
+  as.integer(drug=="ketamine") ~ year
+}
+
+trend_model <- tryCatch(
+  if (!single_hosp_site) {
+    glmer(trend_formula, data=df_trend, family=binomial,
+          control=glmerControl(optimizer="bobyqa"))
+  } else {
+    glm(trend_formula, data=df_trend, family=binomial)
+  },
+  error=function(e){cat("  Time trend model failed:",conditionMessage(e),"\n");NULL}
+)
+
+if (!is.null(trend_model)) {
+  tidy(trend_model, effects="fixed", exponentiate=TRUE, conf.int=TRUE) %>%
+    mutate(site_id=SITE_ID, model="drug_choice_time_trend",
+           model_type=case_when(
+             !single_hosp_site & include_hosp_type ~ "multi-hosp + hospital_type",
+             !single_hosp_site                     ~ "multi-hosp, no hospital_type",
+             include_hosp_type                     ~ "single-hosp + hospital_type (glm)",
+             TRUE                                  ~ "single-hosp, year only (glm)")) %>%
+    { write_csv(., out_mod("time_trend_model_results.csv")); . } %>%
+    knitr::kable(digits=3, caption="Time trend model: drug choice ~ year")
+}
+```
+
+---
+
+# Section 8 — Final Exports and Run Summary
+
+```{r site-metadata}
+tibble(
+  site_id              = SITE_ID,
+  n_total              = nrow(df),
+  n_etomidate          = sum(df$drug=="etomidate"),
+  n_ketamine           = sum(df$drug=="ketamine"),
+  n_hospitals          = n_hospitals,
+  n_hospitals_re       = n_hospitals_re,
+  n_providers          = n_distinct(df$provider_id),
+  n_providers_re       = n_providers_re,
+  single_hosp_site     = single_hosp_site,
+  imputation_method    = imputation_method,
+  date_range_years     = paste(min(df$calendar_year,na.rm=TRUE),
+                               max(df$calendar_year,na.rm=TRUE),sep="-"),
+  script_version       = "v0.9_6hr",
+  run_datetime         = format(Sys.time(),"%Y-%m-%d %H:%M:%S"),
+  r_version            = as.character(getRversion()),
+  lme4_version         = as.character(packageVersion("lme4")),
+  lmm_etomidate_model_type = if(!is.null(lmm_etomidate)) lmm_etomidate$variance_components$model_type[1] else NA_character_,
+  lmm_ketamine_model_type  = if(!is.null(lmm_ketamine))  lmm_ketamine$variance_components$model_type[1]  else NA_character_,
+  lmm_etomidate_singular   = if(!is.null(lmm_etomidate)) any(is.na(lmm_etomidate$variance_components$ci_lo)) else NA,
+  lmm_ketamine_singular    = if(!is.null(lmm_ketamine))  any(is.na(lmm_ketamine$variance_components$ci_lo))  else NA
+) %>% { write_csv(., out_diag("site_metadata.csv")); . } %>%
+  knitr::kable(caption="Site metadata")
+```
+
+```{r file-checklist}
+expected_files <- list(
+  list(f="02_cohort_summary.csv",              fn=out_diag),
+  list(f="01_missingness_raw.csv",             fn=out_diag),
+  list(f="01_impossible_values.csv",           fn=out_diag),
+  list(f="01_exclusion_waterfall.csv",         fn=out_diag),
+  list(f="01_provider_encounter_dist.png",     fn=out_diag),
+  list(f="01_provider_encounter_table.csv",    fn=out_diag),
+  list(f="01_missing_weight.csv",              fn=out_diag),
+  list(f="02_derived_variable_checks.csv",     fn=out_diag),
+  list(f="02_missingness_analytic.csv",        fn=out_diag),
+  list(f="site_metadata.csv",                  fn=out_diag),
+  list(f="table1_by_drug.csv",                 fn=out_tbl),
+  list(f="table1_missingness.csv",             fn=out_tbl),
+  list(f="table1_icu_type.csv",                fn=out_tbl),
+  list(f="dose_tier_counts.csv",               fn=out_tbl),
+  list(f="dose_categorical_counts.csv",        fn=out_tbl),
+  list(f="hospital_dose_summary.csv",          fn=out_tbl),
+  list(f="provider_dose_summary.csv",          fn=out_tbl),
+  list(f="03_provider_drug_choice_summary.csv",fn=out_tbl),
+  list(f="table3_dose_by_strata.csv",          fn=out_tbl),
+  list(f="variance_components.csv",            fn=out_mod),
+  list(f="fixed_effects.csv",                  fn=out_mod),
+  list(f="icc_results.csv",                    fn=out_mod),
+  list(f="aim4_mor_icc_results.csv",           fn=out_mod),
+  list(f="aim4_fixed_effects.csv",             fn=out_mod),
+  list(f="aim4_subgroup_mor_results.csv",      fn=out_mod),
+  list(f="time_trend_model_results.csv",       fn=out_mod),
+  list(f="sa_rawmg_variance_components.csv",   fn=out_mod),
+  list(f="sa_rawmg_fixed_effects.csv",         fn=out_mod),
+  list(f="sa_rawmg_icc_results.csv",           fn=out_mod),
+  list(f="sa_provider_fixed_lrt.csv",          fn=out_mod),
+  list(f="sa_drug_choice_mor_icc.csv",         fn=out_mod),
+  list(f="sa_drug_choice_fixed_effects.csv",   fn=out_mod),
+  list(f="dose_distribution_percentiles.csv",  fn=out_fig),
+  list(f="dose_decile_percentiles.csv",        fn=out_fig),
+  list(f="annual_dose_trends.csv",             fn=out_fig),
+  list(f="quarterly_dose_trends.csv",          fn=out_fig),
+  list(f="drug_choice_by_year.csv",            fn=out_fig),
+  list(f="drug_choice_by_quarter.csv",         fn=out_fig),
+  list(f="dose_by_location.csv",               fn=out_fig),
+  list(f="drug_choice_by_location.csv",        fn=out_fig),
+  list(f="fig_dose_histogram.png",             fn=out_fig),
+  list(f="fig_dose_tier_bar.png",              fn=out_fig),
+  list(f="fig_annual_trends.png",              fn=out_fig),
+  list(f="fig_variance_decomposition.png",     fn=out_fig)
+)
+
+checklist <- map_dfr(expected_files, function(item) {
+  full_path <- item$fn(item$f)
+  tibble(file = item$f, status = if (file.exists(full_path)) "OK" else "MISSING")
+})
+
+all_present <- all(checklist$status == "OK")
+checklist %>% knitr::kable(caption=paste0("File checklist — ",
+  if(all_present) "ALL FILES PRESENT" else "WARNING: MISSING FILES"))
+
+if (all_present) {
+  cat("\nAll expected files present. Please send output_to_share_6hr/ to coordinating center.\n")
+} else {
+  cat("\nWARNING: Missing files detected. Review errors above before submitting.\n")
+}
+
+cat("\n=======================================================\n")
+cat("  RUN COMPLETE — v0.9_6hr\n")
+cat("=======================================================\n")
+cat("  Analytic cohort:", nrow(df), "encounters\n")
+cat("    Etomidate:    ", sum(df$drug=="etomidate"), "\n")
+cat("    Ketamine:     ", sum(df$drug=="ketamine"), "\n")
+cat("  Hospitals:      ", n_hospitals, "(", n_hospitals_re, "meet RE threshold)\n")
+cat("  Providers:      ", n_distinct(df$provider_id), "(", n_providers_re, "meet RE threshold)\n")
+cat("  Imputation:     ", imputation_method, "\n")
+cat("  Run completed:  ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
+```
+
+---
+
+# Output File Summary
+
+All files written to `output_to_share_6hr/` with prefix `SITE_ID_`. Return the entire folder to the coordinating center.
+
+**Diagnostics:**
+- `02_cohort_summary.csv` — merged QC + analytic cohort counts ⭐
+- `01_missingness_raw.csv`, `02_missingness_analytic.csv` — missingness reports
+- `01_impossible_values.csv`, `01_exclusion_waterfall.csv` — data quality
+- `01_provider_encounter_dist.png`, `01_provider_encounter_table.csv` — provider structure
+- `01_missing_weight.csv`, `02_derived_variable_checks.csv` — cohort checks
+- `site_metadata.csv` — model types, versions, run info ⭐
+
+**Tables:**
+- `table1_by_drug.csv`, `table1_missingness.csv`, `table1_icu_type.csv` — Table 1
+- `dose_tier_counts.csv`, `dose_categorical_counts.csv` — dose tier summaries
+- `hospital_dose_summary.csv`, `provider_dose_summary.csv` — provider/hospital dose
+- `03_provider_drug_choice_summary.csv` — provider drug preference
+- `table3_dose_by_strata.csv` — dose by setting ⭐
+
+**Models:**
+- `variance_components.csv`, `fixed_effects.csv`, `icc_results.csv` — **primary result** ⭐
+- `aim4_mor_icc_results.csv`, `aim4_fixed_effects.csv` — Aim 4 mOR ⭐
+- `aim4_subgroup_mor_results.csv` — subgroup mOR (Figure 7 input)
+- `time_trend_model_results.csv` — drug choice trend
+- `sa_rawmg_*.csv`, `sa_provider_fixed_lrt.csv`, `sa_drug_choice_*.csv` — sensitivity analyses
+
+**Figures (CSVs + PNGs):**
+- `dose_distribution_percentiles.csv`, `dose_decile_percentiles.csv` — for pooled histograms
+- `annual_dose_trends.csv`, `drug_choice_by_year.csv`, etc. — for pooled trend figures
+- `fig_dose_histogram.png`, `fig_dose_tier_bar.png`, `fig_annual_trends.png`, `fig_variance_decomposition.png` ⭐
