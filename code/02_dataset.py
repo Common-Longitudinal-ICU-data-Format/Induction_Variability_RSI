@@ -671,6 +671,7 @@ def _(Adt, DATA_DIR, FILETYPE, PatientProcedures, TIMEZONE, cohort, pl):
         )
         .select([
             "hospitalization_id",
+            "hospital_id",
             pl.col("location_category").alias("location_at_intubation"),
             pl.when(pl.col("location_category") == "icu")
               .then(pl.col("location_type"))
@@ -680,9 +681,6 @@ def _(Adt, DATA_DIR, FILETYPE, PatientProcedures, TIMEZONE, cohort, pl):
         ])
         .group_by("hospitalization_id").first()
     )
-
-    # Hospital ID
-    _hospital = adt_pl.select(["hospitalization_id", "hospital_id"]).group_by("hospitalization_id").first()
 
     # ICU LOS (sum of ICU time in days)
     _icu_stays = (
@@ -718,7 +716,6 @@ def _(Adt, DATA_DIR, FILETYPE, PatientProcedures, TIMEZONE, cohort, pl):
 
     location_df = (
         _loc_at_intub
-        .join(_hospital, on="hospitalization_id", how="outer_coalesce")
         .join(_icu_stays, on="hospitalization_id", how="outer_coalesce")
         .join(_provider, on="hospitalization_id", how="outer_coalesce")
     )
@@ -850,6 +847,7 @@ def _(OUTPUT_DIR, SITE, dataset, mo, pl):
         "location_at_intubation",
         "icu_type",
         "hospital_type",
+        "hospital_id",
         pl.col("index_dttm").dt.year().cast(pl.Int16).alias("calendar_year"),
         pl.col("index_dttm").dt.quarter().cast(pl.Int8).alias("calendar_quarter"),
         pl.lit(SITE).alias("site_id"),

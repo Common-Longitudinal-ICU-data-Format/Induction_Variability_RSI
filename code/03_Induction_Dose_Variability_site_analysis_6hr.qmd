@@ -118,8 +118,7 @@ cat("Run started:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
 ```{r load-data}
 df_raw <- read_parquet(data_path) %>%
   rename(
-    hospital_id = site_id,
-    drug        = drug_received
+    drug = drug_received
   ) %>%
   mutate(drug = tolower(trimws(drug)))
 
