@@ -114,7 +114,7 @@ def _(DATA_DIR, FILETYPE, Hospitalization, SITE, TIMEZONE, pl):
 
 @app.cell
 def _(DATA_DIR, FILETYPE, PatientProcedures, SITE, TIMEZONE, hosp_pl, pl):
-    # Inclusion 3: CPT 31500 with non-missing billing_provider_id
+    # Inclusion 3: CPT 31500 with non-missing performing_provider_id
     procs_table = PatientProcedures.from_file(
         data_directory=DATA_DIR,
         filetype=FILETYPE,
@@ -131,14 +131,14 @@ def _(DATA_DIR, FILETYPE, PatientProcedures, SITE, TIMEZONE, hosp_pl, pl):
         & (pl.col("procedure_code_format").str.to_uppercase() == "CPT")
     )
     if SITE == "mimic":
-        # MIMIC lacks billing_provider_id; impute with -9999
+        # MIMIC lacks performing_provider_id; impute with -9999
         cpt_31500 = _cpt_base.with_columns(
-            pl.col("billing_provider_id").fill_null("-9999").alias("billing_provider_id")
+            pl.col("performing_provider_id").fill_null("-9999").alias("performing_provider_id")
         )
     else:
         cpt_31500 = _cpt_base.filter(
-            pl.col("billing_provider_id").is_not_null()
-            & (pl.col("billing_provider_id") != "")
+            pl.col("performing_provider_id").is_not_null()
+            & (pl.col("performing_provider_id") != "")
         )
 
     # Count hospitalizations with ANY CPT 31500 (regardless of provider)
@@ -157,7 +157,7 @@ def _(DATA_DIR, FILETYPE, PatientProcedures, SITE, TIMEZONE, hosp_pl, pl):
     n_excl_cpt = hosp_pl.height - n_after_cpt
     print(f"After CPT 31500 filter: {n_after_cpt:,} (excluded {n_excl_cpt:,})")
     print(f"  - No CPT 31500: {n_no_cpt:,}")
-    print(f"  - CPT 31500 but no billing provider: {n_cpt_no_provider:,}")
+    print(f"  - CPT 31500 but no performing provider: {n_cpt_no_provider:,}")
     return (
         hosp_with_cpt,
         n_after_cpt,
@@ -889,7 +889,7 @@ def _(
             {"step": 0, "description": "Total hospitalizations", "n_remaining": n_total, "n_excluded": 0, "exclusion_reason": None},
             {"step": 1, "description": "Age >= 18", "n_remaining": n_total - n_excl_age, "n_excluded": n_excl_age, "exclusion_reason": "Age < 18"},
             {"step": 2, "description": "Admission & discharge 2018-01-01 to 2025-12-31", "n_remaining": n_after_date, "n_excluded": n_excl_date, "exclusion_reason": "Admission or discharge outside study date range"},
-            {"step": 3, "description": "CPT 31500 with billing provider", "n_remaining": n_after_cpt, "n_excluded": n_excl_cpt, "exclusion_reason": "No CPT 31500 or missing billing_provider_id", "n_no_cpt": n_no_cpt, "n_cpt_no_provider": n_cpt_no_provider},
+            {"step": 3, "description": "CPT 31500 with performing provider", "n_remaining": n_after_cpt, "n_excluded": n_excl_cpt, "exclusion_reason": "No CPT 31500 or missing performing_provider_id", "n_no_cpt": n_no_cpt, "n_cpt_no_provider": n_cpt_no_provider},
             {"step": 4, "description": "RSI pairing (induction + paralytic within 5 min)", "n_remaining": n_after_rsi, "n_excluded": n_excl_rsi, "exclusion_reason": "No valid RSI medication pair"},
             {"step": 5, "description": "ED or ICU location at RSI time", "n_remaining": n_after_loc, "n_excluded": n_excl_loc, "exclusion_reason": "Not in ED or ICU at RSI time"},
             {"step": 6, "description": "IMV within 6 hours of induction", "n_remaining": n_after_imv, "n_excluded": n_excl_imv, "exclusion_reason": "No IMV within 6 hours"},
