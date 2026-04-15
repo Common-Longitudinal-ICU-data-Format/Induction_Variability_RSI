@@ -213,14 +213,14 @@ def _(
         "hospitalization_id",
         pl.col("admin_dttm").alias("admin_dttm_ind"),
         pl.col("med_category").alias("med_category_ind"),
-        pl.col("med_dose").alias("med_dose_ind"),
+        pl.col("med_dose").cast(pl.Float64, strict=False).alias("med_dose_ind"),
         pl.col("med_dose_unit").alias("med_dose_unit_ind"),
     ]).join(
         paralytic.select([
             "hospitalization_id",
             pl.col("admin_dttm").alias("admin_dttm_par"),
             pl.col("med_category").alias("med_category_par"),
-            pl.col("med_dose").alias("med_dose_par"),
+            pl.col("med_dose").cast(pl.Float64, strict=False).alias("med_dose_par"),
             pl.col("med_dose_unit").alias("med_dose_unit_par"),
         ]),
         on="hospitalization_id",
