@@ -67,7 +67,7 @@ This document implements the pre-specified site-level analysis for the **Inducti
 ```{r setup}
 # Install any missing packages before running:
 # install.packages(c("tidyverse","lme4","lmerTest","broom.mixed","boot",
-#                    "gtsummary","here","arrow","mice","patchwork","scales"))
+#                    "gtsummary","here","rprojroot","arrow","mice","patchwork","scales"))
 
 library(tidyverse)
 library(dplyr)
@@ -77,15 +77,16 @@ library(broom.mixed)
 library(boot)
 library(gtsummary)
 library(here)
+library(rprojroot)
 library(arrow)
 library(mice)
 library(patchwork)
 library(scales)
 
 # ---- SITE CONFIGURATION — auto-loaded from clif_config.json ----------------
-cfg       <- jsonlite::fromJSON(here("clif_config.json"))
+cfg <- jsonlite::fromJSON(find_root_file("clif_config.json", criterion = has_file("clif_config.json")))
 SITE_ID   <- cfg$site_name
-data_path <- file.path(here(), cfg$output_directory, "rsi_analysis_dataset_2.parquet")
+data_path <- file.path(cfg$output_directory, "rsi_analysis_dataset_2.parquet")
 # ----------------------------------------------------------------------------
 
 prefer_3level           <- TRUE
@@ -1205,9 +1206,14 @@ bind_rows(lmm_etomidate$icc,lmm_ketamine$icc) %>%
 cat("\nVariance decomposition exported.\n")
 
 # Display variance components
-bind_rows(lmm_etomidate$variance_components, lmm_ketamine$variance_components) %>%
-  select(drug, group, variance, pct_variance, ci_lo, ci_hi, model_type) %>%
-  knitr::kable(digits=3, caption="Variance components by drug")
+vc_display <- bind_rows(lmm_etomidate$variance_components, lmm_ketamine$variance_components)
+if (nrow(vc_display) > 0 && "drug" %in% names(vc_display)) {
+  vc_display %>%
+    select(drug, group, variance, pct_variance, ci_lo, ci_hi, model_type) %>%
+    knitr::kable(digits=3, caption="Variance components by drug")
+} else {
+  cat("No LMM converged for either drug — variance components unavailable at this site.\n")
+}
 ```
 
 ```{r variance-decomp-figure}
