@@ -1430,11 +1430,16 @@ cat("Aim 4 primary models exported.\n")
 ```
 
 ```{r aim4-results-display}
-bind_rows(aim4_etom_thresh$summary, aim4_keta_thresh$summary,
-          aim4_etom_pct$summary,    aim4_keta_pct$summary) %>%
-  select(drug, outcome, model_type, n, pct_outcome, icc_hospital, icc_provider,
-         mor_hospital, mor_provider) %>%
-  knitr::kable(digits=3, caption="Aim 4: mOR and ICC results")
+aim4_display <- bind_rows(aim4_etom_thresh$summary, aim4_keta_thresh$summary,
+                          aim4_etom_pct$summary,    aim4_keta_pct$summary)
+if (nrow(aim4_display) > 0 && "drug" %in% names(aim4_display)) {
+  aim4_display %>%
+    select(drug, outcome, model_type, n, pct_outcome, icc_hospital, icc_provider,
+           mor_hospital, mor_provider) %>%
+    knitr::kable(digits=3, caption="Aim 4: mOR and ICC results")
+} else {
+  cat("No Aim 4 logistic model converged — mOR / ICC unavailable at this site.\n")
+}
 ```
 
 ```{r aim4-subgroups, results='hide'}
