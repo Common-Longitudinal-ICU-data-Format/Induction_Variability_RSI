@@ -67,7 +67,7 @@ This document implements the pre-specified site-level analysis for the **Inducti
 ```{r setup}
 # Install any missing packages before running:
 # install.packages(c("tidyverse","lme4","lmerTest","broom.mixed","boot",
-#                    "gtsummary","here","rprojroot","arrow","mice","patchwork","scales"))
+#                    "gtsummary","here","arrow","mice","patchwork","scales"))
 
 library(tidyverse)
 library(dplyr)
@@ -77,16 +77,22 @@ library(broom.mixed)
 library(boot)
 library(gtsummary)
 library(here)
-library(rprojroot)
 library(arrow)
 library(mice)
 library(patchwork)
 library(scales)
 
 # ---- SITE CONFIGURATION — auto-loaded from clif_config.json ----------------
-cfg <- jsonlite::fromJSON(find_root_file("clif_config.json", criterion = has_file("clif_config.json")))
+cfg <- jsonlite::fromJSON(here("clif_config.json"))
 SITE_ID   <- cfg$site_name
-data_path <- file.path(cfg$output_directory, "rsi_analysis_dataset_2.parquet")
+
+# Resolve output_directory relative to project root if it isn't already absolute,
+# so the path works regardless of the directory `quarto render` is invoked from.
+output_dir <- cfg$output_directory
+if (!grepl("^(/|[A-Za-z]:)", output_dir)) {
+  output_dir <- here(output_dir)
+}
+data_path <- file.path(output_dir, "rsi_analysis_dataset_2.parquet")
 # ----------------------------------------------------------------------------
 
 prefer_3level           <- TRUE
