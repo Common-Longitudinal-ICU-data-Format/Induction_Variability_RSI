@@ -4,7 +4,7 @@
 
 Site-level pipeline for the **Induction Dose Variability during Rapid Sequence Intubation (RSI)** study. This multi-site CLIF Consortium project identifies adults who received RSI with etomidate or ketamine paired with rocuronium or succinylcholine, builds an analytical dataset with clinical covariates, and runs a pre-specified statistical analysis examining the relative contribution of patient, provider, and hospital factors to variability in induction dosing.
 
-**1st Author:** Vaishvik | **Senior Author:** TBD
+**1st Author:** TBD | **Senior Author:** Kevin 
 
 ## Objective
 
